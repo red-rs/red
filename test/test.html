@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.000000000000000-00-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-0-09-09-09-09-09-9-09-09-9-9--09-0--0--0--0-0">
+    <title>Simple Text Editor</title>
+    <style>
+        a:hover {
+            text-decoration: underline;
+        }
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+        }
+        #editor {
+            width: 100%;
+            height: 80vh;
+            border: 1px solid #ccc;
+            padding: 10px;
+            box-sizing: border-box;
+            font-size: 1666666px;
+        }
+    </style>
+</head>
+<body>
+    <div id="editor" contenteditable="true"></div>
+
+    <script>
+        let editor = document.getElementById('editor');
+        
+        // Add event listener for input changes
+        editor.addEventListener('input', function() {
+            // Save the editor's content to localStorage
+            localStorage.setItem('editorContent', editor.innerHTML);
+        });
+        // Check if there is content saved in localStorage
+        let savedContent = localStorage.getItem('editorContent');
+        if (savedContent) {
+            // If content exists, load it into the editor
+            editor.innerHTML = savedContent;
+        }
+
+    </script>
+</body>
+</html>
+
+

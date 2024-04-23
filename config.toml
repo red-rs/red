@@ -1,0 +1,100 @@
+theme = "themes/vesper.yml"
+left_panel_width = 25
+
+[[language]]
+name = "rust"
+types = ["rs"]
+comment = "//"
+lsp = ["rust-analyzer"]
+indent = { width = 4, unit = " " }
+executable = true
+exec = "cargo run {file}"
+exectest = "cargo test -- --show-output {file} {test}"
+
+[[language]]
+name = "go"
+types = ["go"]
+comment = "//"
+lsp = ["gopls"]
+indent = { width = 4, unit = "\t" }
+
+[[language]]
+name = "python"
+types = ["py"]
+comment = "#"
+lsp = ["pyright-langserver", "--stdio"]
+indent = { width = 4, unit = " " }
+executable = true
+exec = "python3 {file}"
+exectest = "python3 -m pytest -k {test} {file}"  
+
+[[language]]
+name = "javascript"
+types = ["js"]
+comment = "//"
+lsp = ["typescript-language-server", "--stdio"]
+indent = { width = 2, unit = " " }
+executable = true
+exec = "tsx {file}"
+# exectest = "tsx -m pytest -k {test} {file}"  
+
+[[language]]
+name = "java"
+types = ["java"]
+comment = "//"
+lsp = ["jdtls"]
+indent = { width = 2, unit = " " }
+executable = true
+exec = "java {file}"
+
+[[language]]
+name = "kotlin"
+types = ["kt"]
+comment = "//"
+lsp = ["kotlin-language-server"]
+indent = { width = 2, unit = " " }
+
+[[language]]
+name = "cpp"
+types = ["cpp"]
+comment = "//"
+lsp = ["clangd"]
+indent = { width = 2, unit = " " }
+
+[[language]]
+name = "c"
+types = ["c", "h"]
+comment = "//"
+lsp = ["clangd"]
+indent = { width = 2, unit = " " }
+
+[[language]]
+name = "zig"
+types = ["zig"]
+comment = "//"
+lsp = ["zls"]
+indent = { width = 2, unit = " " }
+
+[[language]]
+name = "lua"
+types = ["lua"]
+comment = "--"
+lsp = ["lua-language-server"]
+indent = { width = 2, unit = " " }
+executable = true
+exec = "lua {file}"
+
+[[language]]
+name = "shell"
+types = [".sh"]
+comment = "#"
+lsp = ["bash-language-server start"]
+indent = { width = 2, unit = " " }
+executable = true
+exec = "bash {file}"
+
+[[language]]
+name = "json"
+types = [".json"]
+comment = "//"
+indent = { width = 2, unit = " " }

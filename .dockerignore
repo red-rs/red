@@ -1,0 +1,8 @@
+target
+flamegraph.svg
+img*.png
+.vscode
+.idea
+.pytest*
+.DS_Store
+__pycache__
