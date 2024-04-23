@@ -1,4 +1,3 @@
-// main.rs
 mod code;
 mod editor;
 mod lsp;
@@ -22,7 +21,6 @@ async fn main() {
         Some(p) => Some(log2::open(p).start()),
         None => None,
     };
-    // let _log2 = log2::open("red.log").level("off").start();
 
     debug!("starting red");
 

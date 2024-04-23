@@ -80,13 +80,16 @@ With `red`, executing code to a Tmux session is as simple as a button click. Enj
 
 ## Key bindings and features:
 - `Control + q` - quit
-- `Control + d` - duplicate line
-- `Control + x` - cut 
+- `Control + s` - save
 - `Control + c` - copy 
 - `Control + v` - paste
-- `Control + u` - undo
+- `Control + x` - cut 
+- `Control + d` - duplicate
+- `Control + z` - undo
 - `Control + f` - find
 - `Control + f, type prefix, Control + g` - global find
+- `Control + o` - cursor back
+- `Control + p` - cursor forward
 
 - `Shift + arrow` - select text
 - `Option + right/left` - smart horizontal movement
@@ -98,6 +101,13 @@ With `red`, executing code to a Tmux session is as simple as a button click. Enj
 - `mouse selection`  - select text 
 - `mouse double click`  - select word 
 - `mouse triple click`  - select line
+
+
+- `Control + space` - lsp completion
+- `Control + h` - lsp hover
+- `Control + g / Control + mouse click` - lsp definition
+- `Control + r / Option + mouse click` - lsp references
+- `Control + e` - lsp diagnostic (errors)
 
 ## LSP
 

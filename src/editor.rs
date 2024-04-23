@@ -2361,7 +2361,7 @@ impl Editor {
         let (height, mut width) = (5, 30);
         self.upd = true; self.tree_view.upd = true;
 
-        let uri = format!("file://{}", self.code.abs_path.clone());
+        let uri = format!("file://{}", self.code.abs_path);
 
         let diagnostics:Vec<Diagnostic> = {
             let diagnostics = self.diagnostics.clone();
@@ -2372,6 +2372,9 @@ impl Editor {
                 Some(d) => d.diagnostics.iter().filter(|d| d.severity == 1).map(|d|d.clone()).collect(),
                 None => return,
             };
+
+            if diagnostics.is_empty() { return }
+
             diagnostics
         };
 
@@ -2382,7 +2385,9 @@ impl Editor {
             if selected < selected_offset { selected_offset = selected } // calculate scrolling offsets
             if selected >= selected_offset + height { selected_offset = selected - height + 1 }
 
-            let diagnostic = diagnostics.get(selected).unwrap();
+            let diagnostic = match diagnostics.get(selected) {
+                Some(d) => d, None => { break },
+            };
 
             // if diagnostic.uri != format!("file://{}", &self.code.abs_path) {
             //     let path = diagnostic.uri.split("file://").nth(1).unwrap().to_string();
