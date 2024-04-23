@@ -42,7 +42,7 @@ With `red`, executing code to a Tmux session is as simple as a button click. Enj
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/vipmax/red.git
+   git clone https://github.com/red-rs/red.git
    ```
 
 2. Navigate to the project directory:
