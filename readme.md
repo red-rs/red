@@ -33,6 +33,10 @@ With `red`, executing code to a Tmux session is as simple as a button click. Enj
 ### Themes
 `red` comes with a variety of themes to personalize your editing experience. Choose from a selection of carefully crafted themes or create your own to suit your preferences. Compare to others terminal editors, red distinguishes itself by prioritizing background color customization, allowing the window to be fully transparent in accordance with glassmorphism design trends.
 
+### Discussion 
+
+https://t.me/red_rs_editor
+
 ### Prerequisites
 
 - Rust: Ensure you have Rust installed on your system.
