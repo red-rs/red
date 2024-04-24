@@ -345,43 +345,7 @@ impl Editor {
     async fn handle_keyboard(&mut self, event: KeyEvent) {
 
         if self.is_lp_focused {
-            match event.code {
-                KeyCode::Up => self.tree_view.handle_up(),
-                KeyCode::Down => self.tree_view.handle_down(),
-                KeyCode::Left => self.handle_left(),
-                KeyCode::Right => self.handle_right(),
-                KeyCode::Char('t') => {
-                    self.is_lp_focused = false;
-                    self.left_panel_toggle();
-                    self.tree_view.upd = true;
-                    self.upd = true;
-                }
-                KeyCode::Enter => {
-                    match self.tree_view.get_selected() {
-                        None => {}, Some(node) => {
-                            if node.is_file() {
-                                let path = node.fullpath();
-                                self.cursor_history.push(CursorPosition{
-                                    filename: self.code.abs_path.clone(),
-                                    row: self.r, col: self.c, y: self.y, x: self.x,
-                                });
-                                self.tree_view.set_active(path.clone());
-                                self.open_file(&path).await;
-                                self.is_lp_focused = false;
-                            }
-                            else {
-                                node.toggle();
-                            }
-
-                            self.upd = true;
-                            self.tree_view.upd = true;
-                        }
-                    }
-                },
-                _ => {
-                    debug!("event.code {:?}", event.code);
-                }
-            }
+            self.handle_left_panel(event).await;
             return;
         }
 
@@ -442,6 +406,8 @@ impl Editor {
                     KeyCode::Char('v') => self.paste_from_clipboard().await,
                     KeyCode::Char('d') => self.handle_duplicate().await,
                     KeyCode::Char('f') => self.local_search().await,
+                    KeyCode::Char('r') => self.references().await,
+                    KeyCode::Char('g') => self.definition().await,
                     KeyCode::Char('z') => self.undo().await,
                     KeyCode::Char('o') => self.undo_cursor().await,
                     KeyCode::Char('p') => self.redo_cursor().await,
@@ -528,6 +494,62 @@ impl Editor {
         }
     }
 
+
+    async fn handle_left_panel(&mut self, event: KeyEvent) {
+
+        if event.modifiers.contains(KeyModifiers::CONTROL ) && 
+            event.code == KeyCode::Char('t') {
+            // close left panel 
+            self.is_lp_focused = false;
+            self.left_panel_toggle();
+            self.tree_view.upd = true;
+            self.upd = true;
+        }
+
+        match event.code {
+            KeyCode::Up => self.tree_view.handle_up(),
+            KeyCode::Down => self.tree_view.handle_down(),
+            KeyCode::Left => self.tree_view.handle_left(),
+            KeyCode::Right => self.tree_view.handle_right(),
+            KeyCode::Esc => {
+                self.tree_view.clear_search();
+            }
+            KeyCode::Backspace => {
+                self.tree_view.remove_filter_char();
+            },
+            KeyCode::Char(c) => {
+                self.tree_view.insert_filter_char(c);
+            }
+            KeyCode::Enter => {
+                match self.tree_view.get_selected() {
+                    None => {}, Some(node) => {
+                        if node.is_file() {
+                            let path = node.fullpath();
+                            self.cursor_history.push(CursorPosition{
+                                filename: self.code.abs_path.clone(),
+                                row: self.r, col: self.c, y: self.y, x: self.x,
+                            });
+                            self.tree_view.set_active(path.clone());
+                            self.tree_view.clear_search();
+                            self.tree_view.find_expand_by_fullpath(&path);
+                            self.open_file(&path).await;
+                            self.is_lp_focused = false;
+                        }
+                        else {
+                            node.toggle();
+                        }
+
+                        self.upd = true;
+                        self.tree_view.upd = true;
+                    }
+                }
+            },
+            _ => {
+                debug!("event.code {:?}", event.code);
+            }
+        }
+    }
+    
     async fn open_file(&mut self, path: &String) {
         if !self.codes.contains_key(path) { // move self.code code to codes buffer
 
@@ -593,7 +615,13 @@ impl Editor {
                             let rrow = row as usize;
                             let ccol = column as usize;
 
-                            if rrow == self.height-1 && ccol == self.width - 9 { return; }
+                            if rrow == self.height-1 && (
+                                (ccol == self.width - 9) ||
+                                (ccol == self.width - 7) 
+                            ){ 
+                                // button clicked
+                                return; 
+                            }
 
                             if self.lp_width + self.ln_width < ccol &&
                                 ccol < self.lp_width + self.ln_width + self.lns_width - 1 {
@@ -688,13 +716,16 @@ impl Editor {
                         let rrow = row as usize;
                         let ccol = column as usize;
 
-                        let is_left_panel_button_clicked = rrow == self.height-1 &&
-                            ccol == self.width - 9;
-
-                        if is_left_panel_button_clicked {
+                        if rrow == self.height-1 && ccol == self.width - 9 {
+                            // left panel button clicked
                             self.left_panel_toggle();
                             self.tree_view.upd = true;
                             self.upd = true;
+                            return;
+                        }
+                        if rrow == self.height-1 && ccol == self.width - 7 {
+                            // search button clicked
+                            self.local_search().await;
                             return;
                         }
 
@@ -808,18 +839,22 @@ impl Editor {
        Filtering by row improves performance a bit, -2%
     */
     async fn draw(&mut self) {
+        let start = time::Instant::now();
 
         if self.code.file_name.is_empty() {
             queue!(stdout(), cursor::Hide);
+            if self.tree_view.is_search(){ queue!(stdout(), cursor::Show); }
             self.tree_view.draw();
             self.draw_logo();
             self.draw_status();
+            self.tree_view.draw_search();
             stdout().flush().expect("flush");
             return;
         }
 
         self.tree_view.draw();
         self.draw_cursor();
+        self.tree_view.draw_search();
 
 
         if !self.upd || self.height < 1 { return; } // it will do nothing if upd not marked
@@ -828,7 +863,6 @@ impl Editor {
         let mut stdout = stdout();
         queue!(stdout, cursor::Hide).unwrap();
 
-        let start = time::Instant::now();
 
         let status = self.status_line();
 
@@ -980,8 +1014,15 @@ impl Editor {
             }
         }
 
+        self.draw_status();
+        self.draw_cursor();
+
+        self.tree_view.draw_search();
+
+        stdout.flush().expect("flush");
+
         // let elapsed = time::Instant::now() - start;
-        // let ttr = format!("{:?} ms", elapsed.as_millis()); // time to render
+        // let ttr = format!("{:?} ns", elapsed.as_nanos()); // time to render
 
         // queue!(
         //     stdout,
@@ -990,12 +1031,10 @@ impl Editor {
         //     Print(ttr),
         // )
         // .expect("Can not draw time to render");
+        // self.draw_cursor();
 
+        // stdout.flush().expect("flush");
 
-        self.draw_status();
-        self.draw_cursor();
-
-        stdout.flush().expect("flush");
         self.upd = false;
     }
 

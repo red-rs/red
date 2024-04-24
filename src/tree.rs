@@ -1,5 +1,7 @@
+use std::f32::consts::E;
 //tree.rs
 use std::fs;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::io::{self, Write};
 use crossterm::{cursor, queue, QueueableCommand, style::Print};
@@ -20,6 +22,9 @@ pub struct TreeNode {
 }
 
 impl TreeNode {
+    pub fn new(name:String, fullpath:String, is_file: bool) -> Self {
+        Self { name, fullpath, is_file, children: None }
+    }
     pub fn print(&self) { println!("node {:?}", self); }
     pub fn is_file(&mut self) -> bool { self.is_file }
     pub fn fullpath(&mut self) -> String { self.fullpath.clone() }
@@ -46,8 +51,8 @@ impl TreeNode {
             if !is_file && IGNORE_DIRS.contains(&name.as_str()) { continue; }
             if is_file && IGNORE_FILES.contains(&name.as_str()) { continue; }
 
-            if is_file { files.push(TreeNode { name, fullpath, is_file, children: None, }); } 
-            else { directories.push(TreeNode { name, fullpath, is_file, children: None, }); }
+            if is_file { files.push(TreeNode::new(name, fullpath, is_file)); }
+            else { directories.push(TreeNode::new(name, fullpath, is_file)); }
         }
 
         directories.sort_by(|a, b| a.name.cmp(&b.name));
@@ -80,6 +85,29 @@ impl TreeNode {
             }
             None => 0,
         }
+    }
+
+    fn filter_files_mutate(&mut self, pattern: &str) -> bool {
+        let mut found = false;
+        if let Some(children) = &mut self.children {
+            let mut filtered_children = Vec::new();
+            for mut child in children.drain(..) {
+                if child.is_file && child.name.contains(pattern) {
+                    found = true;
+                    filtered_children.push(child);
+                } else if !child.is_file {
+                    child.expand();
+                    // Recursive call for directories
+                    let is_any_found = child.filter_files_mutate(pattern);
+                    if is_any_found {
+                        filtered_children.push(child);
+                        found = true;
+                    }
+                }
+            }
+            self.children = Some(filtered_children);
+        }
+        found
     }
 }
 
@@ -132,17 +160,22 @@ pub struct TreeView {
     active_file: String,
     /// Color for active file.
     active_file_color: Color,
+
+    search: FileSearch,
 }
 
 impl TreeView {
     pub fn new(dir:String) -> Self {
-        let name = if dir == "." { utils::current_directory_name().unwrap() } else { dir.to_string() };
+        let name = if dir == "."  || dir == "./" {
+            utils::current_directory_name().unwrap() 
+        } else { dir.to_string() };
 
         let mut root = TreeNode {
             name,
             fullpath: utils::abs_file(&dir), 
             is_file: false,
             children: None,
+
         };
 
         root.expand();
@@ -150,6 +183,7 @@ impl TreeView {
         Self { width: 25, height: 30, dir, upd: true, root, selected:0, x: 0,
             moving: false, dir_color: Color::Reset, file_color: Color::Reset,
             active_file: String::new(), active_file_color: Color::Reset,
+            search: FileSearch::new(),
         }
     }
 
@@ -161,6 +195,7 @@ impl TreeView {
     pub fn set_moving(&mut self, m: bool) { self.moving = m; self.upd = true; }
     pub fn set_selected(&mut self, i: usize) { self.selected = i + self.x; self.upd = true; }
     pub fn is_moving(&mut self) -> bool { self.moving }
+    pub fn is_search(&mut self) -> bool { self.search.active }
 
     pub(crate) fn handle_up(&mut self) {
         if self.selected == 0 { return; }
@@ -190,16 +225,22 @@ impl TreeView {
         self.upd = true;
     }
 
-    pub fn load_root(&mut self) {
+    pub fn expand_root(&mut self) {
         let root = &mut self.root;
         root.expand();
 
-        if let Some(children) = &mut root.children {
-            for ch in children {
-                ch.expand();
-            }
-        }
     }
+
+    pub fn filter_files_by_pattern(&mut self, pattern: &str) {
+        let root = &mut self.root;
+        root.expand();
+        root.filter_files_mutate(pattern);
+
+        let mut index = 0;
+        Self::find_first_file_index(root, &mut index);
+        self.selected = index;
+    }
+
 
     pub fn draw(&mut self) {
         if !self.upd { return; }
@@ -258,13 +299,28 @@ impl TreeView {
         while count < self.height { // fill empty space
             queue!(stdout, cursor::MoveTo(0, count as u16));
             queue!(stdout, Print(" ".repeat(self.width-1)));
-            queue!(stdout, FColor(Color::DarkGrey), Print('│'));  
+            queue!(stdout, FColor(Color::DarkGrey), Print('│'));
             count += 1;
         }
+
+        self.draw_search();
 
         self.upd = false;
     }
 
+    pub fn draw_search(&self) {
+        if self.search.active {
+            let mut stdout = std::io::stdout();
+            let prefix = "search: ";
+            let search = format!("{}{}", prefix, self.search.pattern.to_string());
+            queue!(stdout,cursor::Show, cursor::MoveTo(0, (self.height -1) as u16));
+            queue!(stdout, Print(&search));
+            queue!(stdout, Print(" ".repeat(self.width-search.len()-1)));
+            queue!(stdout, FColor(Color::DarkGrey), Print('│'));
+            queue!(stdout, cursor::MoveTo((prefix.len() + self.search.index) as u16, (self.height -1) as u16));
+            stdout.flush();
+        }
+    }
     pub fn print(&self) {
         self.print_node(&self.root, 0, &mut 0);
     }
@@ -301,6 +357,11 @@ impl TreeView {
         let root = &mut self.root;
         let maybe_node = Self::find_by_index(root, index, &mut count);
         maybe_node.map(|node| node.expand());
+    }
+
+    pub fn find_expand_by_fullpath(&mut self, fullpath: &str) {
+        let root = &mut self.root;
+        Self::find_by_fullpath_and_expand(root, fullpath);
     }
 
     pub fn find_and_toggle(&mut self, index: usize) {
@@ -346,8 +407,51 @@ impl TreeView {
         return false;
     }
 
+    fn find_first_file_index(node: &mut TreeNode, index: &mut usize) -> bool {
+        if node.is_file {
+            // println!("Found {}: {}", node.name, index);
+            node.expand();
+            return true;
+        }
+
+        // Recursively search children
+        if let Some(children) = &mut node.children {
+            for child in children {
+                *index += 1;
+                let found = Self::find_first_file_index(child, index);
+                if found { return true; }
+            }
+        }
+        return false;
+    }
+
+    pub fn find_by_fullpath_and_expand(node: &mut TreeNode, fullpath: &str) -> bool {
+        if fullpath.starts_with(&node.fullpath) {
+            node.expand();
+        }
+        if fullpath == node.fullpath {
+           return true;
+        }
+        // Recursively search children
+        if let Some(children) = &mut node.children {
+            for child in children {
+                if fullpath.starts_with(&child.fullpath) {
+                    child.expand();
+                    // return true;
+                }
+                let found = Self::find_by_fullpath_and_expand(child, fullpath);
+                if found {
+                    // node.expand();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     pub fn set_active(&mut self, fullpath: String) {
         self.active_file = fullpath;
+        // todo: expand all nodes
     }
     
     pub async fn handle_mouse(&mut self, e: crossterm::event::MouseEvent) {
@@ -363,6 +467,52 @@ impl TreeView {
             }
             _ => {}
        }
+    }
+
+    pub fn insert_filter_char(&mut self, c: char) {
+        self.search.active = true;
+        self.search.pattern.insert_char(self.search.index, c);
+        self.search.index += 1;
+
+        self.filter_files_by_pattern(&self.search.pattern.to_string());
+        self.upd = true;
+    }
+
+    pub fn remove_filter_char(&mut self) {
+        if self.search.index > 0 {
+            self.search.index -= 1;
+            let x = self.search.index;
+            self.search.active = true;
+            self.search.pattern.remove(x..x+1);
+
+            let pattern = self.search.pattern.to_string();
+            if pattern.is_empty() {
+                self.expand_root();
+            } else {
+                self.filter_files_by_pattern(&pattern);
+            }
+
+            self.upd = true;
+        }
+    }
+
+    pub fn handle_left(&mut self) {
+        if self.search.index > 0 {
+            self.search.index -= 1;
+            self.upd = true;
+        };
+    }
+
+    pub fn handle_right(&mut self) {
+        if self.search.index < self.search.pattern.len_chars() {
+            self.search.index += 1;
+            self.upd = true;
+        };
+    }
+    pub fn clear_search(&mut self) {
+        self.search = FileSearch::new();
+        self.upd = true;
+        self.expand_root();
     }
 }
 
@@ -381,7 +531,7 @@ fn list_files_and_directories(path: &str) -> io::Result<Vec<String>> {
 #[cfg(test)]
 mod tree_tests {
     use super::{list_files_and_directories, TreeNode, TreeNodeIterator};
-
+    use crate::tree::TreeView;
 
     #[test]
     fn test_list_files_and_directories() {
@@ -397,12 +547,10 @@ mod tree_tests {
 
     #[test]
     fn test_load() {
-        use crate::tree::TreeView;
-
         let root = ".".to_string();
         let mut tree = TreeView::new(root);
 
-        tree.load_root();
+        tree.expand_root();
         tree.print();
 
         println!("find 5");
@@ -415,44 +563,82 @@ mod tree_tests {
         tree.print();
     }
 
+    #[test]
+    fn test_expand_search() {
+        let root = ".".to_string();
+        let mut tree = TreeView::new(root);
+
+        // tree.load_root();
+        // tree.print();
+
+        println!("find rs");
+
+        tree.filter_files_by_pattern("rs");
+    
+        tree.print();
+
+        // println!("find 16");
+        // let maybe_node = tree.find(16);
+        // maybe_node.map(|node| node.print());
+    }
+
 
 
     #[test]
     fn test_iter() {
-        let root_node = TreeNode {
-            name: "Root".to_string(),
-            fullpath: "/path/to/root".to_string(),
-            is_file: false,
-            children: Some(vec![
-                TreeNode {
-                    name: "Child1".to_string(),
-                    fullpath: "/path/to/root/child1".to_string(),
-                    is_file: true,
-                    children: None,
-                },
-                TreeNode {
-                    name: "Child2".to_string(),
-                    fullpath: "/path/to/root/child2".to_string(),
-                    is_file: false,
-                    children: Some(vec![
-                        TreeNode {
-                            name: "Grandchild1".to_string(),
-                            fullpath: "/path/to/root/child2/grandchild1".to_string(),
-                            is_file: true,
-                            children: None,
-                        },
-                    ]),
-                },
-            ]),
-        };
+        // let root_node = TreeNode {
+        //     name: "Root".to_string(),
+        //     fullpath: "/path/to/root".to_string(),
+        //     is_file: false,
+        //     children: Some(vec![
+        //         TreeNode {
+        //             name: "Child1".to_string(),
+        //             fullpath: "/path/to/root/child1".to_string(),
+        //             is_file: true,
+        //             children: None,
+        //         },
+        //         TreeNode {
+        //             name: "Child2".to_string(),
+        //             fullpath: "/path/to/root/child2".to_string(),
+        //             is_file: false,
+        //             children: Some(vec![
+        //                 TreeNode {
+        //                     name: "Grandchild1".to_string(),
+        //                     fullpath: "/path/to/root/child2/grandchild1".to_string(),
+        //                     is_file: true,
+        //                     children: None,
+        //                 },
+        //             ]),
+        //         },
+        //     ]),
+        //     file_search: FileSearch {},
+        // };
+        //
+        //
+        // for (node, depth) in TreeNodeIterator::new(&root_node).take(2) {
+        //     println!("take depth: {}, Name: {}, Fullpath: {}, Is File: {}", depth, node.name, node.fullpath, node.is_file);
+        // }
+        //
+        // for (node, depth) in TreeNodeIterator::new(&root_node).skip(2) {
+        //     println!("skip depth: {}, Name: {}, Fullpath: {}, Is File: {}", depth, node.name, node.fullpath, node.is_file);
+        // }
+    }
+}
 
 
-        for (node, depth) in TreeNodeIterator::new(&root_node).take(2) {
-            println!("take depth: {}, Name: {}, Fullpath: {}, Is File: {}", depth, node.name, node.fullpath, node.is_file);
-        }
+#[derive(Debug)]
+pub struct FileSearch {
+    pub active: bool,
+    pub pattern: ropey::Rope,
+    pub index:usize,
+}
 
-        for (node, depth) in TreeNodeIterator::new(&root_node).skip(2) {
-            println!("skip depth: {}, Name: {}, Fullpath: {}, Is File: {}", depth, node.name, node.fullpath, node.is_file);
+impl FileSearch {
+    pub fn new() -> Self {
+        Self {
+            active: false,
+            pattern: ropey::Rope::new(),
+            index: 0,
         }
     }
 }
