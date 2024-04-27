@@ -309,17 +309,18 @@ impl TreeView {
     }
 
     pub fn draw_search(&self) {
-        if self.search.active {
-            let mut stdout = std::io::stdout();
-            let prefix = "search: ";
-            let search = format!("{}{}", prefix, self.search.pattern.to_string());
-            queue!(stdout,cursor::Show, cursor::MoveTo(0, (self.height -1) as u16));
-            queue!(stdout, Print(&search));
-            queue!(stdout, Print(" ".repeat(self.width-search.len()-1)));
-            queue!(stdout, FColor(Color::DarkGrey), Print('│'));
-            queue!(stdout, cursor::MoveTo((prefix.len() + self.search.index) as u16, (self.height -1) as u16));
-            stdout.flush();
-        }
+        if !self.search.active || self.width == 0 { return }
+
+        let mut stdout = std::io::stdout();
+        let prefix = " search: ";
+        let search = format!("{}{}", prefix, self.search.pattern.to_string());
+        if search.len() >= self.width { return; } // not enought space
+        queue!(stdout,cursor::Show, cursor::MoveTo(0, (self.height -1) as u16));
+        queue!(stdout, Print(&search));
+        queue!(stdout, Print(" ".repeat(self.width-search.len()-1)));
+        queue!(stdout, FColor(Color::DarkGrey), Print('│'));
+        queue!(stdout, cursor::MoveTo((prefix.len() + self.search.index) as u16, (self.height -1) as u16));
+        // stdout.flush();
     }
     pub fn print(&self) {
         self.print_node(&self.root, 0, &mut 0);
@@ -428,9 +429,6 @@ impl TreeView {
     pub fn find_by_fullpath_and_expand(node: &mut TreeNode, fullpath: &str) -> bool {
         if fullpath.starts_with(&node.fullpath) {
             node.expand();
-        }
-        if fullpath == node.fullpath {
-           return true;
         }
         // Recursively search children
         if let Some(children) = &mut node.children {

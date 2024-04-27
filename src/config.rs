@@ -27,8 +27,8 @@ pub struct IndentConfig {
     pub unit:  String,
 }
 
-    pub fn get() -> Config {
-    let red_home = option_env!("RED_HOME").unwrap_or("./");
+pub fn get() -> Config {
+    let red_home = option_env!("RED_HOME").expect("RED_HOME must be set!");
     let config_path = Path::new(red_home).join("config.toml");
     let toml_str = std::fs::read_to_string(config_path).expect("Unable to read config.toml file");
     let config: Config = toml::from_str(&toml_str).expect("Unable to parse TOML");

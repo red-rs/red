@@ -496,15 +496,25 @@ impl Editor {
 
 
     async fn handle_left_panel(&mut self, event: KeyEvent) {
+        match event.modifiers {
+            KeyModifiers::CONTROL => {
+                if event.code == KeyCode::Char('t') {
+                    // close left panel 
+                    self.is_lp_focused = false;
+                    self.left_panel_toggle();
+                    self.tree_view.upd = true;
+                    self.upd = true;
+                }
+                return;
+            }
+            KeyModifiers::NONE => {
 
-        if event.modifiers.contains(KeyModifiers::CONTROL ) && 
-            event.code == KeyCode::Char('t') {
-            // close left panel 
-            self.is_lp_focused = false;
-            self.left_panel_toggle();
-            self.tree_view.upd = true;
-            self.upd = true;
+            },
+            _ => {
+                return;
+            },
         }
+
 
         match event.code {
             KeyCode::Up => self.tree_view.handle_up(),
