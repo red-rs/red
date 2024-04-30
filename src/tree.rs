@@ -444,7 +444,7 @@ impl TreeView {
                 }
             }
         }
-        return false;
+        false
     }
 
     pub fn set_active(&mut self, fullpath: String) {

@@ -1,12 +1,14 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
 
 pub struct Process {
     kill_sender: Option<tokio::sync::mpsc::Sender<String>>,
     process_lines: Arc<Mutex<Vec<String>>>,
     upd_process: Arc<AtomicBool>,
     process_started: Arc<Mutex<bool>>,
+    last_cmd: String
 }
 
 impl Process {
@@ -16,23 +18,32 @@ impl Process {
             process_lines: Arc::new(Mutex::new(vec![])),
             upd_process: Arc::new(AtomicBool::new(false)),
             process_started: Arc::new(Mutex::new(false)),
+            last_cmd: String::new(),
         }
     }
    
-    pub fn start_tmux(&mut self, args:&String) {
-        let red_home = option_env!("RED_HOME").unwrap_or("./");
+    pub fn run_tmux(&mut self, args:&String) {
+        let red_home = env!("RED_HOME");
         let tmux_path = std::path::Path::new(red_home).join("tmux.sh");
-        let tmux = tmux_path.to_str();
-        if tmux.is_none() { return; }
 
-        let cmd = tmux.unwrap().to_string();
+        let cmd = match tmux_path.to_str() {
+            Some(tmux) => tmux.to_string(),
+            None => return,
+        };
+
         let args = vec![args.clone()];
+        self.last_cmd = args.join(" ");
 
         tokio::spawn(async move {
-           let output = tokio::process::Command::new(&cmd).args(args)
+            Command::new(&cmd).args(args)
                 .output().await.unwrap();
-
         });
+    }
+
+    pub fn run_last_tmux(&mut self) {
+        if self.last_cmd.is_empty() { return }
+        let last_cmd = self.last_cmd.clone();
+        self.run_tmux(&last_cmd);
     }
 
     pub fn start(&mut self, cmd: &str, arg: &str) {
@@ -94,7 +105,7 @@ impl Process {
                         (*lines).push("Killed".to_string());
 
                         upd_process_needed.store(true, Ordering::SeqCst);
-                        return;
+                        break;
                     }
                     _ = child.wait() => { // process ends
                         let mut is_started = process_started.lock().expect("cant get lock");

@@ -627,8 +627,11 @@ impl Editor {
 
                             if rrow == self.height-1 && (
                                 (ccol == self.width - 9) ||
-                                (ccol == self.width - 7) 
-                            ){ 
+                                (ccol == self.width - 7) ||
+                                (ccol == self.width - 5) ||
+                                (ccol == self.width - 3) ||
+                                (ccol == self.width - 1) 
+                            ) { 
                                 // button clicked
                                 return; 
                             }
@@ -738,13 +741,18 @@ impl Editor {
                             self.local_search().await;
                             return;
                         }
+                        if rrow == self.height-1 && ccol == self.width - 3 {
+                            // last run button clicked
+                            self.process.run_last_tmux();
+                            return;
+                        }
 
                         let is_runnable_button_clicked = self.lp_width + self.ln_width < ccol &&
-                            ccol < self.lp_width + self.ln_width + self.lns_width -1;
+                            ccol < self.lp_width + self.ln_width + self.lns_width - 1;
 
                         if is_runnable_button_clicked {
                             match self.code.get_runnable(row as usize + self.y) {
-                                Some(runnable) => self.process.start_tmux(&runnable.cmd),
+                                Some(runnable) => self.process.run_tmux(&runnable.cmd),
                                 None => {},
                             }
                             return;

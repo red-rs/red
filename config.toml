@@ -25,8 +25,8 @@ comment = "#"
 lsp = ["pyright-langserver", "--stdio"]
 indent = { width = 4, unit = " " }
 executable = true
-exec = "python3 {file}"
-exectest = "python3 -m pytest -k {test} {file}"  
+exec = "python {file}"
+exectest = "python -m pytest -k {test} {file}"  
 
 [[language]]
 name = "javascript"
