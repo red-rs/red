@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-// editor.rs
 use std::collections::{HashMap, HashSet};
 use std::io::{stdout, Write};
 use std::path::Path;
@@ -227,8 +226,8 @@ impl Editor {
         let theme_path = if path.is_absolute() {
            path.to_string_lossy().to_string()
         } else {
-            let red_home = option_env!("RED_HOME").unwrap_or("./");
-            Path::new(red_home).join(theme_path).to_string_lossy().to_string()
+            let red_home = std::env::var("RED_HOME").unwrap_or("./".to_string());
+            Path::new(&red_home).join(theme_path).to_string_lossy().to_string()
         };
 
         let theme_content = fs::read_to_string(theme_path).expect("Failed to read theme path file");
@@ -261,7 +260,6 @@ impl Editor {
         let mut reader = EventStream::new();
 
         loop {
-            // let delay = Delay::new(Duration::from_millis(1_00)).fuse();
             let event = reader.next().fuse();
 
             tokio::select! {
@@ -271,18 +269,6 @@ impl Editor {
                     self.upd = true;
                     self.draw().await;
                 }
-                // _ = delay => {
-                    // println!(".\r");
-                    // let upd_process = self.upd_process.clone();
-                    // let mut upd_process = upd_process.lock().expect("cant get lock");
-
-                    // if self.process.upd() {
-                    //     self.draw_process();
-                    //     self.draw_status();
-                    //     self.draw_cursor();
-                    //     // *upd_process = false;
-                    // }
-                // },
 
                 maybe_event = event => {
                     match maybe_event {
@@ -1392,10 +1378,6 @@ impl Editor {
             self.handle_cut().await;
         }
 
-        // let mut clipboard = arboard::Clipboard::new().unwrap();  // slow comp time because of images lib
-        // let text = clipboard.get_text().unwrap_or_default();
-
-
         let mut ctx = ClipboardContext::new().unwrap();
         let text = ctx.get_contents().unwrap();
         self.code.insert_text(&text, self.r, self.c);
@@ -1948,6 +1930,7 @@ impl Editor {
             }
         });
     }
+    
     pub async fn lsp_completion(&mut self) {
         let mut end = false;
 

@@ -22,7 +22,7 @@ indent = { width = 4, unit = "\t" }
 name = "python"
 types = ["py"]
 comment = "#"
-lsp = ["pyright-langserver", "--stdio"]
+lsp = ["pylsp"]
 indent = { width = 4, unit = " " }
 executable = true
 exec = "python {file}"

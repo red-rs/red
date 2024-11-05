@@ -50,15 +50,13 @@ impl Lsp {
         }
     }
 
-    pub fn start(&mut self, lang: &str, cmd: &str, 
-        diagnostic_updates: Option<mpsc::Sender<DiagnosticParams>>) 
-        ->  io::Result<()>
-    {
-        // let cmd = match lsp_servers::lang2server(&lang) {
-        //     Some(cmd) => cmd,
-        //     None => return,
-        // };
-
+    pub fn start(
+        &mut self, 
+        lang: &str, 
+        cmd: &str, 
+        diagnostic_updates: Option<mpsc::Sender<DiagnosticParams>>
+    )->  io::Result<()> {
+        
         let s: Vec<&str> = cmd.split(" ").collect();
         let cmd = s[0];
         let args = &s[1..];

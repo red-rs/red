@@ -21,5 +21,5 @@ COPY --from=builder /app/test ./test
 ENV RED_HOME=/app
 CMD ["./red"]
 
-# docker build -f .dockerfile -t red:latest .
+# docker build -t red:latest .
 # docker run -it --rm red:latest

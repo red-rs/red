@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-// Define a struct to represent the TOML configuration
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub theme: String,
@@ -28,8 +27,8 @@ pub struct IndentConfig {
 }
 
 pub fn get() -> Config {
-    let red_home = option_env!("RED_HOME").expect("RED_HOME must be set!");
-    let config_path = Path::new(red_home).join("config.toml");
+    let red_home = std::env::var("RED_HOME").expect("RED_HOME must be set");
+    let config_path = Path::new(&red_home).join("config.toml");
     let toml_str = std::fs::read_to_string(config_path).expect("Unable to read config.toml file");
     let config: Config = toml::from_str(&toml_str).expect("Unable to parse TOML");
     config

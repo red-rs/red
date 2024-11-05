@@ -1,4 +1,3 @@
-// utils.rs
 use std::collections::HashMap;
 use crossterm::style::Color;
 use serde_yaml::Value;

@@ -1,4 +1,3 @@
-// selection.rs
 pub struct Point {
     pub y: i32,
     pub x: i32,

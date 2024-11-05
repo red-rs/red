@@ -1,5 +1,5 @@
-// code.rs
 use crossterm::style::Color;
+use rayon::vec;
 use ropey::iter::Lines;
 use ropey::Rope;
 use ropey::RopeSlice;
@@ -16,6 +16,7 @@ use crate::config::{Config, Language};
 use crate::utils::{self, hex_to_color};
 use strfmt::strfmt;
 use log2::*;
+use streaming_iterator::StreamingIterator;
 
 pub struct Code {
     pub file_name: String,
@@ -79,24 +80,24 @@ impl Code {
         let lang_conf = lang_conf.map(|lc| (*lc).clone());
 
         let language = match lang.as_str() {
-            "rust" => tree_sitter_rust::language(),
-            "javascript" => tree_sitter_javascript::language(),
-            "python" => tree_sitter_python::language(),
-            "go" => tree_sitter_go::language(),
-            "yaml" => tree_sitter_yaml::language(),
-            "html" => tree_sitter_html::language(),
-            "shell" => tree_sitter_bash::language(),
-            "toml" => tree_sitter_toml::language(),
-            "java" => tree_sitter_java::language(),
-            "kotlin" => tree_sitter_kotlin::language(),
-            "cpp" => tree_sitter_cpp::language(),
-            "c" => tree_sitter_c::language(),
-            "zig" => tree_sitter_zig::language(),
-            "lua" => tree_sitter_lua::language(),
-            "json" => tree_sitter_json::language(),
+            "rust" => tree_sitter_rust::LANGUAGE.into(),
+            "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+            "python" => tree_sitter_python::LANGUAGE.into(),
+            "go" => tree_sitter_go::LANGUAGE.into(),
+            "yaml" => tree_sitter_yaml::language().into(),
+            "html" => tree_sitter_html::LANGUAGE.into(),
+            "shell" => tree_sitter_bash::LANGUAGE.into(),
+            // "toml" => tree_sitter_toml::language().into(),
+            "java" => tree_sitter_java::LANGUAGE.into(),
+            // "kotlin" => tree_sitter_kotlin::LANGUAGE.into(),
+            "cpp" => tree_sitter_cpp::LANGUAGE.into(),
+            "c" => tree_sitter_c::LANGUAGE.into(),
+            // "zig" => tree_sitter_zig::LANGUAGE.into(),
+            // "lua" => tree_sitter_lua::LANGUAGE.into(),
+            "json" => tree_sitter_json::LANGUAGE.into(),
              _ => {
                 lang = "text".to_string();
-                tree_sitter_rust::language()
+                tree_sitter_rust::LANGUAGE.into()
             }
         };
 
@@ -119,7 +120,7 @@ impl Code {
         }
 
         let mut parser = Parser::new();
-        parser.set_language(language).expect("Can not set_language");
+        parser.set_language(&language).expect("Can not set_language");
 
         let tree = parser.parse(text.to_string(), None);
 
@@ -130,19 +131,19 @@ impl Code {
         // "fn" @keyword
         // "#;
 
-        let red_home = option_env!("RED_HOME").unwrap_or("./");
+        let red_home = std::env::var("RED_HOME").unwrap_or("./".to_string());
 
-        let lang_highlights = Path::new(red_home).join("langs").join(lang.clone()).join("highlights.scm");
+        let lang_highlights = Path::new(&red_home).join("langs").join(lang.clone()).join("highlights.scm");
         let err_message = format!("Failed to read highlights.scm file: {:?}", lang_highlights);
         let query_pattern = fs::read_to_string(lang_highlights).expect(&err_message.as_str());
-        let query = match Query::new(language, &query_pattern) {
+        let query = match Query::new(&language, &query_pattern) {
             Ok(q) => Some(q),
             Err(e) => { debug!("err {}", e); None },
         };
 
-        let scm = Path::new(red_home).join("langs").join(lang.clone()).join("tests.scm");
+        let scm = Path::new(&red_home).join("langs").join(lang.clone()).join("tests.scm");
         let query_test = match fs::read_to_string(scm) {
-            Ok(qp) => Query::new(language, &qp).ok(),
+            Ok(qp) => Query::new(&language, &qp).ok(),
             Err(_) => None,
         };
 
@@ -204,6 +205,7 @@ impl Code {
             old_end_position: Point { row: 0, column: 0 },
             new_end_position: Point { row: 0, column: 0 },
         };
+        debug!("ts insert {:?}", edit);
         self.apply_edit(edit);
     }
 
@@ -285,8 +287,21 @@ impl Code {
     }
     fn tree_parse(&mut self) {
         if let Some(parser) = &mut self.parser {
-            let text = self.text.to_string();
-            self.tree = parser.parse(text, self.tree.as_ref());
+            // let text = self.text.to_string();
+            let rope = &self.text;
+            self.tree = parser.parse_with(&mut |byte, _| {
+                // debug!("parse_with {}", byte);
+                let sl = if byte <= rope.len_bytes() {
+                    let (chunk, start, _, _) = rope.chunk_at_byte(byte);
+                    chunk[byte - start..].as_bytes()
+                } else {
+                    &[]
+                };
+                // debug!("sl {:?}", String::from_utf8_lossy(sl));
+                sl
+            }, self.tree.as_ref());
+
+            // self.tree = parser.parse(text, self.tree.as_ref());
         }
     }
 
@@ -493,11 +508,13 @@ impl Code {
         query_cursor.set_byte_range(start_index..end_index); //superfast
 
         let root = self.tree.as_ref().unwrap().root_node();
-        let matches = query_cursor.matches(&query, root, RopeProvider(self.text.slice(..)));
 
-        matches
-            .flat_map(|m| m.captures)
-            .map(|capture| {
+        let mut query_matches = query_cursor.matches(&query, root, RopeProvider(self.text.slice(..)));
+        
+        let mut result = Vec::new();
+
+        while let Some(m) = query_matches.next() {
+            for capture in m.captures {
                 let capture_index = capture.index as usize;
                 let capture_name = &query.capture_names()[capture_index];
                 let name = capture_name.split('.').next().unwrap_or(capture_name);
@@ -505,17 +522,21 @@ impl Code {
                 let color = theme_colors
                     .map(|s| hex_to_color(s))
                     .unwrap_or(Color::Reset);
-                // let text = self.text.byte_slice(capture.node.start_byte()..capture.node.end_byte()).as_str();
-                (
-                    capture.node.start_byte(),
-                    capture.node.end_byte(),
-                    capture.node.start_position().row,
-                    capture.node.end_position().row,
-                    color,
-                )
-            })
-            .filter(|(_, _, _, _, color)| *color != Color::Reset)
-            .collect()
+                
+                if color == Color::Reset { continue }
+
+                result.push((
+                    capture.node.start_byte(), 
+                    capture.node.end_byte(), 
+                    capture.node.start_position().row, 
+                    capture.node.end_position().row, 
+                    color
+                ));
+            }
+        }
+        
+        result
+
     }
 
     fn update_runnables(&mut self) {
@@ -549,9 +570,9 @@ impl Code {
                 let mut query_cursor = QueryCursor::new();
 
                 let root = self.tree.as_ref().unwrap().root_node();
-                let matches = query_cursor.matches(&query, root, RopeProvider(self.text.slice(..)));
+                let mut matches = query_cursor.matches(&query, root, RopeProvider(self.text.slice(..)));
 
-                for m in matches {
+                while let Some(m) = matches.next() {
                     for capture in m.captures {
                         let capture_index = capture.index as usize;
                         let capture_name = &query.capture_names()[capture_index];
@@ -639,22 +660,21 @@ pub struct Runnable {
     pub row: usize,
 }
 
-struct ChunksBytes<'a> {
+pub struct ChunksBytes<'a> {
     chunks: ropey::iter::Chunks<'a>,
 }
 
 impl<'a> Iterator for ChunksBytes<'a> {
     type Item = &'a [u8];
-
+    
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         self.chunks.next().map(str::as_bytes)
     }
 }
 
-struct RopeProvider<'a>(RopeSlice<'a>);
-
-impl<'a> TextProvider<'a> for RopeProvider<'a> {
+pub struct RopeProvider<'a>(pub RopeSlice<'a>);
+impl<'a> TextProvider<&'a [u8]> for RopeProvider<'a> {
     type I = ChunksBytes<'a>;
 
     #[inline]

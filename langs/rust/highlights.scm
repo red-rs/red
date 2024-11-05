@@ -44,9 +44,9 @@
 (lifetime
   "'" @label
   (identifier) @label)
-(loop_label
-  "'" @label
-  (identifier) @label)
+;(loop_label
+;  "'" @label
+;  (identifier) @label)
 
 
 ; ---

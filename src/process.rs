@@ -23,8 +23,8 @@ impl Process {
     }
    
     pub fn run_tmux(&mut self, args:&String) {
-        let red_home = env!("RED_HOME");
-        let tmux_path = std::path::Path::new(red_home).join("tmux.sh");
+        let red_home = std::env::var("RED_HOME").expect("RED_HOME must be set");
+        let tmux_path = std::path::Path::new(&red_home).join("tmux.sh");
 
         let cmd = match tmux_path.to_str() {
             Some(tmux) => tmux.to_string(),
@@ -161,4 +161,73 @@ impl Process {
             None // Return None if start_index is out of bounds
         }
     }
+}
+
+
+mod process_tests {
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    use super::Process;
+
+    // #[tokio::test]
+    // async fn test_process_start() {
+    //     let mut process = Process::new();
+    //     process.start("echo", "Hello, World!");
+
+    //     // Wait for some time to allow process to start and output something
+    //     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+    //     let lines_lock = process.lines().lock();
+    //     let lines = lines_lock.unwrap();
+    //     assert!(lines.len() > 0);
+    //     assert_eq!(lines[0], "Hello, World!");
+    // }
+
+    // #[tokio::test]
+    // async fn test_process_kill() {
+    //     let mut process = Process::new();
+    //     process.start("sleep", "10"); // A long-running process
+
+    //     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    //     process.kill_process().await;
+
+    //     // Wait for some time to allow the process to be killed
+    //     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    //     let lines = process.lines().lock().await;
+    //     assert!(lines.contains(&"Killed".to_string()));
+    // }
+
+    // #[tokio::test]
+    // async fn test_process_update() {
+    //     let process = Process::new();
+    //     process.start("echo", "Hello, World!");
+
+    //     // Wait for some time to allow process to start and output something
+    //     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    //     assert!(process.upd());
+
+    //     process.update_false();
+    //     assert!(!process.upd());
+    // }
+
+    #[tokio::test]
+    async fn test_lines_range() {
+        let mut process = Process::new();
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        process.start("echo", "Line 1");
+        process.start("echo", "Line 2");
+
+        // Wait for some time to allow process to output lines
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        let lines = process.lines_range(0, 2);
+        // assert!(lines.is_some());
+        let lines = lines.unwrap();
+        assert_eq!(lines[0], "Line 1");
+        assert_eq!(lines[1], "Line 2");
+    }
+
 }

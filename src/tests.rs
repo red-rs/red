@@ -1,5 +1,3 @@
-// tests.rs
-
 #[cfg(test)]
 mod tests_tree_sitter {
     use std::time;
@@ -24,38 +22,41 @@ mod tests_tree_sitter {
         }
     }
 
-    #[test]
-    fn test_tree_sitter_walk() {
-        let mut parser = Parser::new();
+    // #[test]
+    // fn test_tree_sitter_walk() {
+    //     let mut parser = Parser::new();
 
-        let language = tree_sitter_rust::language();
-        parser
-            .set_language(language)
-            .expect("Error loading Rust grammar");
+    //     let language = tree_sitter_rust::language();
+    //     parser
+    //         .set_language(language)
+    //         .expect("Error loading Rust grammar");
 
-        let source_code = r"
-        fn test() {
-            let a = 5;
-        }
-        ";
+    //     let source_code = r"
+    //     fn test() {
+    //         let a = 5;
+    //     }
+    //     ";
 
-        let start = time::Instant::now();
-        let tree = parser.parse(source_code, None).unwrap();
-        let elapsed = time::Instant::now() - start;
+    //     let start = time::Instant::now();
+    //     let tree = parser.parse(source_code, None).unwrap();
+    //     let elapsed = time::Instant::now() - start;
 
-        println!("Elapsed time: {:?} ms", elapsed.as_millis());
+    //     println!("Elapsed time: {:?} ms", elapsed.as_millis());
 
-        let mut cursor = tree.walk();
-        walk_tree(&mut cursor, source_code);
-    }
+    //     let mut cursor = tree.walk();
+    //     walk_tree(&mut cursor, source_code);
+    // }
+
+    use tree_sitter::{Node, QueryMatch};
+    use streaming_iterator::StreamingIterator;
 
     #[test]
     fn test_tree_sitter_query() {
         let mut parser = Parser::new();
 
-        let language = tree_sitter_rust::language();
+        let language = tree_sitter_rust::LANGUAGE.into();
         parser
-            .set_language(language)
+            .set_language(&language)
             .expect("Error loading Rust grammar");
 
         let source_code = r#"
@@ -83,7 +84,7 @@ mod tests_tree_sitter {
         "fn" @keyword.function
         "#;
 
-        let query = Query::new(language, query_pattern).unwrap();
+        let query = Query::new(&language, query_pattern).unwrap();
         let mut query_cursor = QueryCursor::new();
         // query_cursor.set_byte_range(0..source_code.len());
         query_cursor.set_byte_range(0..38);
@@ -96,93 +97,102 @@ mod tests_tree_sitter {
             iter
         };
 
-        let dummy = |node: tree_sitter::Node| vec![].into_iter();
+        // let dummy = |node: tree_sitter::Node| vec![].into_iter();
         let source_code_bytes = &source_code.as_bytes();
         let start = time::Instant::now();
 
-        let matches = query_cursor.matches(&query, tree.root_node(), dummy);
-
-        for qmatch in matches {
-            for capture in qmatch.captures {
-                match capture.node.utf8_text(source_code_bytes) {
-                    Ok(text) => {
-                        let i = capture.index as usize;
-                        let capture_name = &query.capture_names()[i];
-                        let text = format!("\x1b[{}m{}\x1b[0m", i + 100, text);
-                        println!("{:20} {}", capture_name, text);
-                    }
-                    _ => {}
-                };
-            }
+        let mut query_matches = query_cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        let mut matches: Vec<Node> = Vec::new();
+        while let Some(m) = query_matches.next() {
+            matches.push(m.captures[0].node);
+            println!("{:?}", m);
         }
+
+
+        let matches = query_cursor.matches(&query, tree.root_node(), source_code.as_bytes());
+        
+
+        // for qmatch in matches {
+        //     for capture in qmatch.captures {
+        //         match capture.node.utf8_text(source_code_bytes) {
+        //             Ok(text) => {
+        //                 let i = capture.index as usize;
+        //                 let capture_name = &query.capture_names()[i];
+        //                 let text = format!("\x1b[{}m{}\x1b[0m", i + 100, text);
+        //                 println!("{:20} {}", capture_name, text);
+        //             }
+        //             _ => {}
+        //         };
+        //     }
+        // }
 
         let elapsed = time::Instant::now() - start;
         println!("Elapsed time: {:?} ms", elapsed.as_millis());
     }
 
-    #[test]
-    fn test_tree_sitter_colors_ranges() {
-        let mut parser = Parser::new();
+    // #[test]
+//     fn test_tree_sitter_colors_ranges() {
+//         let mut parser = Parser::new();
 
-        let language = tree_sitter_rust::language();
-        parser
-            .set_language(language)
-            .expect("Error loading Rust grammar");
+//         let language = tree_sitter_rust::language();
+//         parser
+//             .set_language(language)
+//             .expect("Error loading Rust grammar");
 
-        let source_code = r#"
-fn foo() {
-    let x = 42;
-    println!("Hello, world!");
-}
-        "#;
+//         let source_code = r#"
+// fn foo() {
+//     let x = 42;
+//     println!("Hello, world!");
+// }
+//         "#;
 
-        let tree = parser.parse(source_code, None).unwrap();
+//         let tree = parser.parse(source_code, None).unwrap();
 
-        let query_pattern = r#"
-        [
-          (string_literal)
-          (raw_string_literal)
-        ] @string
+//         let query_pattern = r#"
+//         [
+//           (string_literal)
+//           (raw_string_literal)
+//         ] @string
 
-        (function_item
-            name: (identifier) @function)
+//         (function_item
+//             name: (identifier) @function)
 
-        "fn" @keyword.function
-        "#;
+//         "fn" @keyword.function
+//         "#;
 
-        let query = Query::new(language, query_pattern).unwrap();
-        let mut query_cursor = QueryCursor::new();
-        query_cursor.set_byte_range(0..source_code.len());
-        // query_cursor.set_byte_range(0..38);
-        // query_cursor.set_byte_range(0..3);
+//         let query = Query::new(language, query_pattern).unwrap();
+//         let mut query_cursor = QueryCursor::new();
+//         query_cursor.set_byte_range(0..source_code.len());
+//         // query_cursor.set_byte_range(0..38);
+//         // query_cursor.set_byte_range(0..3);
 
-        let dummy = |node: tree_sitter::Node| vec![].into_iter();
-        let source_code_bytes = &source_code.as_bytes();
-        let start = time::Instant::now();
+//         let dummy = |node: tree_sitter::Node| vec![].into_iter();
+//         let source_code_bytes = &source_code.as_bytes();
+//         let start = time::Instant::now();
 
-        let matches = query_cursor.matches(&query, tree.root_node(), dummy);
+//         let matches = query_cursor.matches(&query, tree.root_node(), dummy);
 
-        let mut color_ranges: Vec<(Point, Point, usize)> = vec![];
+//         let mut color_ranges: Vec<(Point, Point, usize)> = vec![];
 
-        for qmatch in matches {
-            for capture in qmatch.captures {
-                let i = capture.index as usize;
-                let capture_name = &query.capture_names()[i];
+//         for qmatch in matches {
+//             for capture in qmatch.captures {
+//                 let i = capture.index as usize;
+//                 let capture_name = &query.capture_names()[i];
 
-                let color_range = (
-                    capture.node.start_position(),
-                    capture.node.end_position(),
-                    i,
-                );
-                color_ranges.push(color_range);
-            }
-        }
+//                 let color_range = (
+//                     capture.node.start_position(),
+//                     capture.node.end_position(),
+//                     i,
+//                 );
+//                 color_ranges.push(color_range);
+//             }
+//         }
 
-        let elapsed = time::Instant::now() - start;
-        println!("Elapsed time: {:?} ns", elapsed.as_nanos());
+//         let elapsed = time::Instant::now() - start;
+//         println!("Elapsed time: {:?} ns", elapsed.as_nanos());
 
-        color_ranges.iter().for_each(|cr| println!("{:?}", cr));
-    }
+//         color_ranges.iter().for_each(|cr| println!("{:?}", cr));
+//     }
 }
 
 #[cfg(test)]

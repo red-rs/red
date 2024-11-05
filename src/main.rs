@@ -17,9 +17,9 @@ use log2::*;
 async fn main() {
     let current_dir = utils::current_directory_name().unwrap();
 
-    let logger = match option_env!("RED_LOG") {
-        Some(p) => Some(log2::open(p).start()),
-        None => None,
+    let logger = match std::env::var("RED_LOG") {
+        Ok(p) => Some(log2::open(&p).start()),
+        Err(_) => None,
     };
 
     debug!("starting red");
