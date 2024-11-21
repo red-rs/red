@@ -4,7 +4,7 @@ use std::io::{stdout, Write};
 use std::path::Path;
 use std::time::Instant;
 use std::{fs, time};
-use log2::debug;
+use log2::{debug, info, error};
 
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
@@ -662,6 +662,8 @@ impl Editor {
                                 return;
                             }
 
+                            if self.code.file_name.is_empty() { return }
+
                             let (prev_r, prev_c) = (self.r.clone(), self.c.clone());
 
                             self.handle_mouse_click(row as usize, column as usize);
@@ -849,7 +851,7 @@ impl Editor {
             queue!(stdout(), cursor::Hide);
             if self.tree_view.is_search(){ queue!(stdout(), cursor::Show); }
             self.tree_view.draw();
-            self.draw_logo();
+            // self.draw_logo();
             self.draw_status();
             self.tree_view.draw_search();
             stdout().flush().expect("flush");
@@ -1751,8 +1753,21 @@ impl Editor {
                                         },
                                         KeyCode::Left if x > 0 => x -= 1,
                                         KeyCode::Right if x < self.search.pattern.len_chars() => x += 1,
-                                        KeyCode::Enter => { end = true; },
-                                        KeyCode::Esc => { end = true; },
+                                        KeyCode::Enter => { 
+                                            if self.code.file_name.is_empty() {
+                                                self.global_search().await;
+                                                self.overlay_lines.clear();
+                                                self.upd = true;
+                                                if self.code.file_name.is_empty() {
+                                                    queue!(stdout(), terminal::Clear(ClearType::All));
+                                                    stdout().flush();
+                                                }
+                                            }   
+                                            end = true;
+                                        },
+                                        KeyCode::Esc => { 
+                                            end = true; 
+                                        },
                                         KeyCode::Backspace if x > 0 => {
                                             x -= 1;
                                             self.clean_search_line();
@@ -2546,19 +2561,25 @@ impl Editor {
         let mut search_results:Vec<(String, search::search::SearchResult)> = Vec::new();
 
         let start = Instant::now();
-        let search_resilts = search::search::search_in_directory(&path, &self.search.pattern.to_string());
-
+        info!("Starting global search {:?} {} ms", &path, &self.search.pattern);
+        let search_res = search::search::search_in_directory(&path, &self.search.pattern.to_string());
         let elapsed = start.elapsed().as_millis();
+        info!("Ending global search {:?} {} ms", &path, &self.search.pattern);
 
-        match search_resilts {
+        match search_res {
             Ok(srs) => {
                 for sr in srs {
                     for r in sr.search_results {
                         search_results.push((sr.file_path.clone(), r));
                     }
                 }
+
+                info!("found {} results elapsed {} ms", search_results.len(), elapsed);
             },
-            Err(_) => return,
+            Err(e) => {
+                error!("search error {}", e);
+                return
+            }
         }
 
         if search_results.is_empty() { return; }

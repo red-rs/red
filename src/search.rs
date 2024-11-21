@@ -27,6 +27,10 @@ impl Search {
 pub mod search {
     use std::path::{Path, PathBuf};
     use std::{fs, time};
+    use rayon::prelude::*;
+    
+    use log2::{debug, info, error};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub const IGNORE_EXTS: &[&str] = &[
         "doc", "docx", "pdf", "rtf", "odt", "xlsx", "pptx", "jpg", "png", "gif", "bmp", "svg",
@@ -35,36 +39,47 @@ pub mod search {
     ];
 
     pub fn read_directory_recursive(dir_path: &Path) -> Result<Vec<PathBuf>, io::Error> {
+        // eprintln!("read_directory_recursive {:?}", dir_path);
+        
         let mut paths = Vec::new();
+        
+        let entries = match fs::read_dir(dir_path) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
 
-        let entries = fs::read_dir(dir_path)?;
+        // Convert entries to Vec to enable parallel processing
+        let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        
+        // Process entries in parallel
+        let mut sub_paths: Vec<PathBuf> = entries.par_iter()
+            .filter_map(|entry| {
+                let path = entry.path();
+                let file_name = path.file_name()?.to_string_lossy().to_lowercase();
 
-        for entry in entries.filter_map(|entry| entry.ok()) {
-            let path = entry.path();
-            let file_name = match path.file_name() {
-                Some(name) => name.to_string_lossy().to_lowercase(),
-                None => continue,
-            };
-
-            if crate::utils::IGNORE_DIRS.contains(&file_name.to_string().as_str()) {
-                continue;
-            }
-
-            if path.is_dir() {
-                let sub_dir_result = read_directory_recursive(&path)?;
-                paths.extend(sub_dir_result);
-            } else {
-                let file_ext = match path.extension() {
-                    Some(ext) => ext.to_string_lossy().to_lowercase(),
-                    None => continue,
-                };
-
-                if !IGNORE_EXTS.contains(&file_ext.to_string().as_str()) {
-                    paths.push(path);
+                if file_name.starts_with('.') || crate::utils::IGNORE_DIRS.contains(&file_name.as_str()) {
+                    return None;
                 }
-            }
-        }
 
+                if path.is_dir() {
+                    match read_directory_recursive(&path) {
+                        Ok(sub_paths) => Some(sub_paths),
+                        Err(_) => None,
+                    }
+                } else {
+                    let file_ext = path.extension()?.to_string_lossy().to_lowercase();
+                    if !IGNORE_EXTS.contains(&file_ext.as_str()) {
+                        Some(vec![path])
+                    } else {
+                        None
+                    }
+                }
+            })
+            .flatten()
+            .collect();
+
+        paths.append(&mut sub_paths);
         Ok(paths)
     }
 
@@ -150,31 +165,62 @@ pub mod search {
     ) -> io::Result<Vec<FileSearchResult>> {
         use rayon::prelude::*;
 
-        let file_paths = read_directory_recursive(directory_path)?;
+        let file_paths = read_directory_recursive(directory_path)
+            .expect("cant get files recursively");
 
-        file_paths
-            // .into_iter()
+        // eprintln!("[]Found {} files", file_paths.len());
+
+        let start = Instant::now();
+        let files_processed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let matches_found = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let results = file_paths
             .par_iter()
-            .map(|file_path| {
+            .filter_map(|file_path| {
+                let files = files_processed.fetch_add(1, Ordering::Relaxed);
+                // if files % 1000 == 0 {
+                //     eprintln!(
+                //         "Processed {} files, found {} matches ({:?} elapsed)",
+                //         files,
+                //         matches_found.load(Ordering::Relaxed),
+                //         start.elapsed()
+                //     );
+                // }
+
                 let path = file_path.to_str().expect("Invalid file path");
-                let search_results = search_on_file(path, substring_to_find)?;
-                Ok(FileSearchResult {
-                    file_path: file_path.to_string_lossy().to_string(),
-                    search_results,
-                })
+                let search_results = search_on_file(path, substring_to_find)
+                    .ok()?;
+
+                matches_found.fetch_add(search_results.len(), Ordering::Relaxed);
+
+                if !search_results.is_empty() {
+                    Some(FileSearchResult {
+                        file_path: file_path.to_string_lossy().to_string(),
+                        search_results,
+                    })
+                } else {
+                    None
+                }
             })
-            .collect()
+            .collect();
+
+        // eprintln!(
+        //     "Search complete: processed {} files, found {} matches in {:?}",
+        //     files_processed.load(Ordering::Relaxed),
+        //     matches_found.load(Ordering::Relaxed),
+        //     start.elapsed()
+        // );
+
+        Ok(results)
     }
 
-    use tokio::task;
 
     #[tokio::test]
     async fn test_find_substring_on_dir() {
         use std::path::Path;
-
-        // let directory_path = Path::new("/Users/max/Downloads/spark");
+        println!("hi");
         let directory_path = Path::new("./");
-        let substring_to_find = "test";
+        let substring_to_find = "red";
 
         let start = Instant::now();
         let search_results = search_in_directory(directory_path, substring_to_find);
@@ -196,60 +242,12 @@ pub mod search {
                 //     }
                 // }
             }
-            Err(_) => {}
+            Err(e) => {
+                println!("error {}", e);
+            }
         }
     }
 
-    // async fn process_file(
-    //     file_path: PathBuf,
-    //     substring_to_find: &str,
-    // ) -> io::Result<FileSearchResult> {
-    //     let path = file_path.to_str().expect("Invalid file path");
-    //     let search_results = search_on_file(path, substring_to_find)?;
-    //     Ok(FileSearchResult {
-    //         file_path,
-    //         search_results,
-    //     })
-    // }
-
-    //
-    // async fn search_in_directory_par(directory_path: &Path, substring_to_find: &str)
-    //                                  -> io::Result<Vec<FileSearchResult>> {
-    //
-    //     let file_paths = read_directory_recursive(directory_path)?;
-    //
-    //     let mut tasks = Vec::new();
-    //
-    //     for file_path in file_paths {
-    //
-    //         let substring = substring_to_find.to_string(); // Clone the string
-    //
-    //         let task = tokio::task::spawn_blocking( move || {
-    //             process_file(file_path.clone(), &substring)
-    //         });
-    //
-    //         tasks.push(task);
-    //     }
-    //
-    //     for task in tasks {
-    //         let x = task.await.unwrap();
-    //
-    //     }
-    //
-    //     Ok(vec![])
-    // }
-    //
-    // #[tokio::test]
-    // async fn my_test() {
-    //     let directory_path = Path::new("./");
-    //     let substring_to_find = "test";
-    //     let results = search_in_directory_par(directory_path, substring_to_find).await.unwrap();
-    //
-    //     // Now you can assert or perform actions on the results
-    //     assert_eq!(results.len(), 4);
-    //     // Add more assertions as needed
-    // }
-    // doesnt work!
 }
 
 mod tokio_tests {
