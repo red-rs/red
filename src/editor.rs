@@ -625,7 +625,7 @@ impl Editor {
                             if self.lp_width + self.ln_width < ccol &&
                                 ccol < self.lp_width + self.ln_width + self.lns_width - 1 {
                                 // clicked on run button column
-
+                                
                                 return;
                             }
 
@@ -732,6 +732,12 @@ impl Editor {
                         if rrow == self.height-1 && ccol == self.width - 3 {
                             // last run button clicked
                             self.process.run_last_tmux();
+                            return;
+                        }
+                        if rrow == self.height-1 && ccol == self.width - 1 {
+                            // exit button clicked
+                            Editor::deinit();
+                            std::process::exit(0);
                             return;
                         }
 

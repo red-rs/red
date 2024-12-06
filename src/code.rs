@@ -82,9 +82,9 @@ impl Code {
         let language = match lang.as_str() {
             "rust" => tree_sitter_rust::LANGUAGE.into(),
             "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+            "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             "python" => tree_sitter_python::LANGUAGE.into(),
             "go" => tree_sitter_go::LANGUAGE.into(),
-            "yaml" => tree_sitter_yaml::language().into(),
             "html" => tree_sitter_html::LANGUAGE.into(),
             "shell" => tree_sitter_bash::LANGUAGE.into(),
             // "toml" => tree_sitter_toml::language().into(),
@@ -95,6 +95,9 @@ impl Code {
             // "zig" => tree_sitter_zig::LANGUAGE.into(),
             // "lua" => tree_sitter_lua::LANGUAGE.into(),
             "json" => tree_sitter_json::LANGUAGE.into(),
+            "yaml" => tree_sitter_yaml::language().into(),
+            "toml" => tree_sitter_toml_ng::LANGUAGE.into(),
+
              _ => {
                 lang = "text".to_string();
                 tree_sitter_rust::LANGUAGE.into()
@@ -522,7 +525,11 @@ impl Code {
                 let color = theme_colors
                     .map(|s| hex_to_color(s))
                     .unwrap_or(Color::Reset);
-                
+
+                // let node_text = self.text.byte_slice(
+                //     capture.node.start_byte()..capture.node.end_byte()
+                // ).as_str().unwrap_or_default(); // debug
+
                 if color == Color::Reset { continue }
 
                 result.push((

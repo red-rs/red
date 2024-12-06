@@ -1,0 +1,7 @@
+[
+    {
+        "label": "red",
+        "command": "cargo run --release",
+        "cwd": "$ZED_WORKTREE_ROOT"
+    }
+]

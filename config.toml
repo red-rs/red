@@ -30,7 +30,17 @@ exectest = "python -m pytest -k {test} {file}"
 
 [[language]]
 name = "javascript"
-types = ["js"]
+types = ["js", "jsx"]
+comment = "//"
+lsp = ["typescript-language-server", "--stdio"]
+indent = { width = 2, unit = " " }
+executable = true
+exec = "tsx {file}"
+# exectest = "tsx -m pyt
+
+[[language]]
+name = "typescript"
+types = ["ts", "tsx"]
 comment = "//"
 lsp = ["typescript-language-server", "--stdio"]
 indent = { width = 2, unit = " " }
