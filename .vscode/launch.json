@@ -1,0 +1,46 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'red'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=red",
+                    "--package=red"
+                ],
+                "filter": {
+                    "name": "red",
+                    "kind": "bin"
+                }
+            },
+            "args": ["test/test.ts"],
+            "env": {"RED_LOG": "red.log"},
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'red'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=red",
+                    "--package=red"
+                ],
+                "filter": {
+                    "name": "red",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
