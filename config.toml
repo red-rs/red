@@ -49,6 +49,14 @@ exec = "tsx {file}"
 # exectest = "tsx -m pytest -k {test} {file}"  
 
 [[language]]
+name = "css"
+types = ["css"]
+comment = "//"
+lsp = ["vscode-css-language-server", "--stdio"]
+indent = { width = 2, unit = " " }
+executable = false
+
+[[language]]
 name = "java"
 types = ["java"]
 comment = "//"

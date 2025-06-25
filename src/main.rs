@@ -8,6 +8,7 @@ mod tree;
 mod tests;
 mod utils;
 mod config;
+mod screen;
 
 use editor::Editor;
 

@@ -10,7 +10,8 @@ use tokio::sync::watch::error;
 use crate::utils;
 use crate::utils::{IGNORE_DIRS, IGNORE_FILES};
 use crossterm::style::{Color, SetBackgroundColor as BColor, SetForegroundColor as FColor};
-
+use crossterm::terminal::Clear;
+use crossterm::terminal::ClearType;
 #[derive(Debug)]
 pub struct TreeNode {
     name: String,
@@ -192,19 +193,41 @@ impl TreeView {
     pub fn set_active_file_color(&mut self, c: Color) { self.active_file_color = c; self.upd = true; }
     pub fn set_moving(&mut self, m: bool) { self.moving = m; self.upd = true; }
     pub fn set_selected(&mut self, i: usize) { self.selected = i + self.x; self.upd = true; }
+    pub fn set_scroll(&mut self, x: usize) { self.x = x; self.upd = true; }
     pub fn is_moving(&mut self) -> bool { self.moving }
     pub fn is_search(&mut self) -> bool { self.search.active }
 
     pub(crate) fn handle_up(&mut self) {
         if self.selected == 0 { return; }
         self.selected -= 1;
+
+        if self.x > self.selected {
+            self.x = self.selected;
+        } else {
+            if self.selected >= self.x + self.height {
+                self.x = self.selected - self.height + 1;
+            }
+        }
+
+
         self.upd = true;
     }
+
     pub(crate) fn handle_down(&mut self) {
         if self.selected >= self.root.len() { 
             return; 
         }
         self.selected += 1;
+
+        if self.x > self.selected {
+            self.x = self.selected;
+        } else {
+            if self.selected >= self.x + self.height {
+                self.x = self.selected - self.height + 1;
+            }
+        }
+
+      
         self.upd = true;
     }
 
@@ -226,7 +249,6 @@ impl TreeView {
     pub fn expand_root(&mut self) {
         let root = &mut self.root;
         root.expand();
-
     }
 
     pub fn filter_files_by_pattern(&mut self, pattern: &str) {
@@ -240,7 +262,7 @@ impl TreeView {
     }
 
 
-    pub fn draw(&mut self) {
+    pub fn draw(&mut self, clear: bool) {
         if !self.upd { return; }
         if self.width == 0 { return; }
 
@@ -289,7 +311,11 @@ impl TreeView {
                     queue!(stdout, Print(' '));
                 }
             }
-            queue!(stdout, FColor(Color::DarkGrey), Print('│'));
+            
+            queue!(stdout, Print(" "));
+            // queue!(stdout, FColor(Color::DarkGrey), BColor(Color::Red), Print('│'));
+
+            if clear { queue!(stdout, Clear(ClearType::UntilNewLine)); }
 
             count += 1;
         }
@@ -297,7 +323,9 @@ impl TreeView {
         while count < self.height { // fill empty space
             queue!(stdout, cursor::MoveTo(0, count as u16));
             queue!(stdout, Print(" ".repeat(self.width-1)));
-            queue!(stdout, FColor(Color::DarkGrey), Print('│'));
+            queue!(stdout, Print(" "));
+            // queue!(stdout, FColor(Color::DarkGrey), Print('│'));
+            if clear { queue!(stdout, Clear(ClearType::UntilNewLine)); }
             count += 1;
         }
 
@@ -508,7 +536,6 @@ impl TreeView {
     pub fn clear_search(&mut self) {
         self.search = FileSearch::new();
         self.upd = true;
-        self.expand_root();
     }
 }
 
@@ -636,5 +663,9 @@ impl FileSearch {
             pattern: ropey::Rope::new(),
             index: 0,
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pattern.len_chars() == 0
     }
 }

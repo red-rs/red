@@ -45,6 +45,12 @@ use tokio::sync::Mutex;
 use std::sync::Arc;
 
 use copypasta::{ClipboardContext, ClipboardProvider};
+use crate::screen::ScreenBuffer;
+
+use notify::{
+    recommended_watcher, RecursiveMode, Watcher,
+    event::AccessKind, event::AccessMode, event::ModifyKind,
+};
 
 /// Represents a text editor.
 pub struct Editor {
@@ -56,7 +62,8 @@ pub struct Editor {
     height: usize,
     /// Terminal width.
     width: usize,
-
+    /// Screen buffer.
+    screen_buffer: ScreenBuffer,
     /// Cursor row.
     r: usize,
     /// Cursor column.
@@ -121,6 +128,9 @@ pub struct Editor {
     is_lp_focused: bool,
 
     node_path: Option<NodePath>,
+    
+    watcher: Option<notify::FsEventWatcher>,
+    self_update: bool
 }
 
 impl Editor {
@@ -130,6 +140,7 @@ impl Editor {
             code: Code::new(),
             height: 0,
             width: 0,
+            screen_buffer: ScreenBuffer::new(0, 0),
             ln_width: 5,
             lns_width: 5,
             r: 0, c: 0, x: 0, y: 0,
@@ -155,6 +166,8 @@ impl Editor {
             cursor_history_undo: CursorHistory::new(),
             is_lp_focused: false,
             node_path: None,
+            watcher: None,
+            self_update: false,
         }
     }
 
@@ -166,6 +179,9 @@ impl Editor {
                 self.code = code;
                 self.r = 0; self.c = 0; self.y = 0; self.x = 0;
                 self.selection.clean();
+                execute!(stdout(), crossterm::cursor::SetCursorStyle::BlinkingBar)
+                    .expect("Could not set cursor style");
+
             }
             Err(e) => {},
         }
@@ -174,15 +190,19 @@ impl Editor {
     pub fn open_left_panel(&mut self) {
         self.lp_width = self.config.left_panel_width.unwrap_or(25);
         self.is_lp_focused = true;
+        self.resize(self.width, self.height);
     }
     pub fn close_left_panel(&mut self) {
         self.lp_width = 0;
+        self.resize(self.width, self.height);
     }
     pub fn left_panel_toggle(&mut self) {
         if self.lp_width > 0 { self.lp_width = 0; }
         else { self.lp_width = self.config.left_panel_width.unwrap_or(25); }
 
+        self.resize(self.width, self.height);
         self.tree_view.set_width(self.lp_width);
+        self.upd = true;
     }
 
     pub fn init(&mut self) {
@@ -221,17 +241,9 @@ impl Editor {
 
     fn configure_theme(&mut self) {
         let theme_path = &self.config.theme;
-        let path = Path::new(theme_path);
-
-        let theme_path = if path.is_absolute() {
-           path.to_string_lossy().to_string()
-        } else {
-            let red_home = std::env::var("RED_HOME").unwrap_or("./".to_string());
-            Path::new(&red_home).join(theme_path).to_string_lossy().to_string()
-        };
-
-        let theme_content = fs::read_to_string(theme_path).expect("Failed to read theme path file");
-        let theme_yaml = serde_yaml::from_str(&theme_content).expect("Failed to parse theme yaml file ");
+        let theme_content = crate::config::get_file_content(theme_path).unwrap();
+        let theme_yaml = serde_yaml::from_str(&theme_content)
+            .expect("Failed to parse theme yaml file ");
         self.theme = utils::yaml_to_map(theme_yaml);
 
         self.lncolor = self.theme.get("lncolor").map(|c| utils::hex_to_color(c)).unwrap_or(Color::AnsiValue(247));
@@ -252,10 +264,23 @@ impl Editor {
 
         self.draw().await;
 
-        let (diagnostic_send, mut diagnostic_recv) = tokio::sync::mpsc::channel::<DiagnosticParams>(1);
+        let (diagnostic_send, mut diagnostic_rx) = tokio::sync::mpsc::
+            channel::<DiagnosticParams>(1);
         self.diagnostics_sender = Some(diagnostic_send.clone());
 
         self.init_new_lsp();
+        
+        let (watch_tx, mut watch_rx) = tokio::sync::mpsc::
+            channel::<notify::Result<notify::Event>>(32);
+        
+        let mut watcher = recommended_watcher(move |res| {
+            let _ = watch_tx.blocking_send(res);
+        }).unwrap();
+        
+        let p = Path::new(&self.code.abs_path);
+        watcher.watch(p, RecursiveMode::Recursive);
+        
+        self.watcher = Some(watcher);
 
         let mut reader = EventStream::new();
 
@@ -263,52 +288,110 @@ impl Editor {
             let event = reader.next().fuse();
 
             tokio::select! {
-                Some(upd) = diagnostic_recv.recv() => {
-                    let filename = upd.uri.clone();
-                    self.diagnostics.lock().await.insert(filename, upd);
-                    self.upd = true;
-                    self.draw().await;
+                Some(event) = watch_rx.recv() => {
+                    self.handle_watch_event(event).await;
                 }
 
-                maybe_event = event => {
-                    match maybe_event {
-                        Some(Ok(event)) => {
-                            // println!("Event::{:?}\r", event);
+                Some(upd) = diagnostic_rx.recv() => {
+                    self.handle_diagnostic_update(upd).await;
+                }
 
-                            match event {
-                                Event::Resize(w, h) => {
-                                    self.resize(w as usize, h as usize);
-                                    self.draw().await;
-                                }
-                                Event::Mouse(e) => {
-                                    self.handle_mouse(e).await;
-                                    self.draw().await;
-                                }
-                                Event::Key(e) => {
-                                    if self.is_quit(e) { break }
-
-                                    #[cfg(target_os = "windows")] { // skip press event on windows
-                                        if e.kind == KeyEventKind::Press { continue; }
-                                    };
-                                    self.handle_keyboard(e).await;
-
-                                    self.draw().await;
-                                    if self.upd_next {
-                                        self.upd = true;
-                                        self.upd_next = false;
-                                    }
-                                }
-                                Event::FocusGained => {}
-                                Event::FocusLost => {}
-                                Event::Paste(_) => {}
-                            }
-                        }
-                        Some(Err(e)) => { /* println!("Error: {:?}\r", e) */ } ,
-                        None => break,
-                    }
+                Some(Ok(event)) = event => {
+                    if self.is_quit_event(&event) { break }
+                    self.handle_terminal_event(event).await;
                 }
             };
         }
+    }
+    
+    async fn handle_watch_event(&mut self, res: Result<notify::Event, notify::Error>) {
+        match res {
+            Ok(event) => {
+                // println!("File event: {:?}", event);
+                
+                match event.kind {
+
+                    notify::EventKind::Modify(ModifyKind::Data(_)) => {
+                        let selfpath = Path::new(&self.code.abs_path);
+                        
+                        if self.self_update {
+                            self.self_update = false;
+                            return;
+                        }
+                        
+                        let is_need_update = event.paths.iter()
+                            .any(|p| p == &selfpath);
+                            
+                        if is_need_update {
+                            debug!("Self update detected");
+                            self.code.reload();
+                            self.lsp_update().await;
+                            self.upd = true;
+                            self.draw().await;
+                        }
+                    }
+                    
+                    _ => {}
+                }
+            }
+            Err(err) => {
+                // eprintln!("Watch error: {:?}", err);
+            }
+        }
+    }
+    
+    fn is_quit_event(
+        &mut self, event: &Event
+    ) -> bool {
+        match event {
+            Event::Key(e) => {
+                if e.modifiers == KeyModifiers::CONTROL &&
+                   e.code == KeyCode::Char('q') { 
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
+    
+    async fn handle_terminal_event(
+        &mut self, event:  Event
+    ){
+        match event {
+            Event::Resize(w, h) => {
+                self.resize(w as usize, h as usize);
+                self.draw().await;
+            }
+            Event::Mouse(e) => {
+                self.handle_mouse(e).await;
+                self.draw().await;
+            }
+            Event::Key(e) => {
+                #[cfg(target_os = "windows")] { // skip press event on windows
+                    if e.kind == KeyEventKind::Press { 
+                        anyhow::bail!("skip press event on windows") 
+                    }
+                };
+                self.handle_keyboard(e).await;
+
+                self.draw().await;
+                if self.upd_next {
+                    self.upd = true;
+                    self.upd_next = false;
+                }
+            }
+            Event::FocusGained => {}
+            Event::FocusLost => {}
+            Event::Paste(_) => {}
+        }
+    }
+    
+    async fn handle_diagnostic_update(&mut self, upd: DiagnosticParams) {
+        let filename = upd.uri.clone();
+        self.diagnostics.lock().await.insert(filename, upd);
+        self.upd = true;
+        self.draw().await;
     }
 
     fn is_quit(&self, e: KeyEvent) -> bool {
@@ -316,15 +399,21 @@ impl Editor {
     }
 
     fn resize(&mut self, w: usize, h: usize) {
+        if w == 0 || h == 0 { return; }
         if w != self.width {
             self.width = w;
         }
         if h != self.height {
             self.height = h;
         }
+
+        debug!("resize : {} {}", self.width, self.height);
+
+        let new_width = self.width - self.lp_width - self.ln_width - self.lns_width;
+        // self.screen_buffer.resize(new_width, h);
+        self.screen_buffer = ScreenBuffer::new(new_width, h);
         self.upd = true;
         self.process.update_true();
-
         self.tree_view.set_height(self.height);
     }
 
@@ -395,6 +484,7 @@ impl Editor {
                     KeyCode::Char('r') => self.references().await,
                     KeyCode::Char('g') => self.definition().await,
                     KeyCode::Char('z') => self.undo().await,
+                    KeyCode::Char('y') => self.redo().await,
                     KeyCode::Char('o') => self.undo_cursor().await,
                     KeyCode::Char('p') => self.redo_cursor().await,
                     KeyCode::Char('g') => {
@@ -404,7 +494,10 @@ impl Editor {
                     KeyCode::Char('e') => self.handle_errors().await,
                     KeyCode::Char('h') => self.hover().await,
                     KeyCode::Char('t') => {
-                        if self.lp_width == 0 { self.is_lp_focused = true; self.left_panel_toggle(); }
+                        if self.lp_width == 0 { 
+                            self.is_lp_focused = true;
+                            self.left_panel_toggle(); 
+                        }
                         else {
                             if !self.is_lp_focused {
                                 self.is_lp_focused = true;
@@ -414,7 +507,7 @@ impl Editor {
                             }
                         }
 
-
+                        // self.clear_all();
                         self.tree_view.upd = true;
                         self.upd = true;
                     }
@@ -467,6 +560,8 @@ impl Editor {
             KeyCode::Char('÷') => self.comment_line().await,
             KeyCode::Char(c) => self.insert_char(c).await,
             KeyCode::Tab => self.insert_tab().await,
+            KeyCode::PageUp => self.handle_page_up(),
+            KeyCode::PageDown => self.handle_page_down(),
             _ => {
                 debug!("event.code {:?}", event.code);
             }
@@ -493,9 +588,8 @@ impl Editor {
                 }
                 return;
             }
-            KeyModifiers::NONE => {
-
-            },
+            KeyModifiers::NONE => {},
+            KeyModifiers::SHIFT => {},
             _ => {
                 return;
             },
@@ -526,8 +620,14 @@ impl Editor {
                                 row: self.r, col: self.c, y: self.y, x: self.x,
                             });
                             self.tree_view.set_active(path.clone());
-                            self.tree_view.clear_search();
-                            self.tree_view.find_expand_by_fullpath(&path);
+
+                            if self.tree_view.is_search() {
+                                self.tree_view.clear_search();
+                                self.tree_view.expand_root();
+                                self.tree_view.set_scroll(0);
+                                self.tree_view.find_expand_by_fullpath(&path);
+                            }
+                           
                             self.open_file(&path).await;
                             self.is_lp_focused = false;
                         }
@@ -564,11 +664,16 @@ impl Editor {
                 Some(lsp) => {
                     let mut lsp = lsp.lock().await;
                     let file_content = self.code.text.to_string();
-                    lsp.did_open(&self.code.lang, &path, &file_content);
+                    lsp.did_open(&self.code.lang, &path, &file_content, false);
                 },
                 None => {
                     self.init_new_lsp();
                 },
+            }
+            
+            if let Some(watcher) = self.watcher.as_mut() {
+                let dir = Path::new(path);
+                watcher.watch(dir, RecursiveMode::NonRecursive);
             }
 
         } else {  // move from codes buffer to self.code
@@ -611,16 +716,16 @@ impl Editor {
                             let rrow = row as usize;
                             let ccol = column as usize;
 
-                            if rrow == self.height-1 && (
-                                (ccol == self.width - 9) ||
-                                (ccol == self.width - 7) ||
-                                (ccol == self.width - 5) ||
-                                (ccol == self.width - 3) ||
-                                (ccol == self.width - 1) 
-                            ) { 
-                                // button clicked
-                                return; 
-                            }
+                            // if rrow == self.height-1 && (
+                            //     (ccol == self.width - 9) ||
+                            //     (ccol == self.width - 7) ||
+                            //     (ccol == self.width - 5) ||
+                            //     (ccol == self.width - 3) ||
+                            //     (ccol == self.width - 1) 
+                            // ) { 
+                            //     // button clicked
+                            //     return; 
+                            // }
 
                             if self.lp_width + self.ln_width < ccol &&
                                 ccol < self.lp_width + self.ln_width + self.lns_width - 1 {
@@ -668,6 +773,23 @@ impl Editor {
 
                             self.handle_mouse_click(row as usize, column as usize);
 
+                            let is_shift_pressed = modifiers.contains(KeyModifiers::SHIFT);
+
+                            if is_shift_pressed {
+                                let prev_point = crate::selection::Point { y: prev_r as i32, x: prev_c as i32 };
+                                let point = crate::selection::Point { y: self.r as i32, x: self.c as i32 };
+
+
+                                let direction = if point.greater_than(&prev_point) { "down" } else { "up" };
+                                if direction == "down" {
+                                    self.selection.set_end(self.r, self.c);
+                                } else {
+                                    self.selection.set_start(self.r, self.c);
+                                }
+                                self.upd = true;
+                                return;
+                            }
+
                             if !self.selection.empty() {
                                 self.selection.clean();
                                 self.selection.set_start(self.r, self.c);
@@ -702,6 +824,7 @@ impl Editor {
                     MouseEventKind::ScrollDown => {
                         if (column as usize) < self.lp_width {
                             self.tree_view.scroll_down();
+                            // self.upd = true;
                         } else {
                             self.scroll_down()
                         }
@@ -709,6 +832,7 @@ impl Editor {
                     MouseEventKind::ScrollUp => {
                         if (column as usize) < self.lp_width {
                             self.tree_view.scroll_up();
+                            // self.upd = true;
                         } else {
                             self.scroll_up()
                         }
@@ -717,29 +841,29 @@ impl Editor {
                         let rrow = row as usize;
                         let ccol = column as usize;
 
-                        if rrow == self.height-1 && ccol == self.width - 9 {
-                            // left panel button clicked
-                            self.left_panel_toggle();
-                            self.tree_view.upd = true;
-                            self.upd = true;
-                            return;
-                        }
-                        if rrow == self.height-1 && ccol == self.width - 7 {
-                            // search button clicked
-                            self.local_search().await;
-                            return;
-                        }
-                        if rrow == self.height-1 && ccol == self.width - 3 {
-                            // last run button clicked
-                            self.process.run_last_tmux();
-                            return;
-                        }
-                        if rrow == self.height-1 && ccol == self.width - 1 {
-                            // exit button clicked
-                            Editor::deinit();
-                            std::process::exit(0);
-                            return;
-                        }
+                        // if rrow == self.height-1 && ccol == self.width - 9 {
+                        //     // left panel button clicked
+                        //     self.left_panel_toggle();
+                        //     self.tree_view.upd = true;
+                        //     self.upd = true;
+                        //     return;
+                        // }
+                        // if rrow == self.height-1 && ccol == self.width - 7 {
+                        //     // search button clicked
+                        //     self.local_search().await;
+                        //     return;
+                        // }
+                        // if rrow == self.height-1 && ccol == self.width - 3 {
+                        //     // last run button clicked
+                        //     self.process.run_last_tmux();
+                        //     return;
+                        // }
+                        // if rrow == self.height-1 && ccol == self.width - 1 {
+                        //     // exit button clicked
+                        //     Editor::deinit();
+                        //     std::process::exit(0);
+                        //     return;
+                        // }
 
                         let is_runnable_button_clicked = self.lp_width + self.ln_width < ccol &&
                             ccol < self.lp_width + self.ln_width + self.lns_width - 1;
@@ -781,6 +905,7 @@ impl Editor {
                             }
                             self.lp_width = column as usize;
                             self.tree_view.set_width(column as usize);
+                            self.resize(self.width, self.height);
                             self.upd = true;
                             return;
                         }
@@ -819,20 +944,21 @@ impl Editor {
     }
 
     fn status_line(&self) -> String {
+        // let buttons = format!("  {} {} {} {} {}", '☰','☌', '', '▶', '⛭' );
+        let buttons = "".to_string();
+
         if self.code.file_name.is_empty() {
-            format!("  {} {} {} {} {}",
-                '☰','☌', '', '▶', '⛭'
-            )
+            format!("  {}", buttons)
         } else {
             let changed = if self.code.changed { "*" } else { " " };
-            format!("  {}:{} {} {}{} {} {} {} {} {}",
+            format!("  {}:{} {} {}{}{}",
                 self.r + 1, self.c + 1, self.code.lang, self.code.file_name, changed,
-                '☰','☌', '', '▶', '⛭'
+                buttons
             )
         }
     }
 
-    fn clear_all(&mut self) {
+    pub fn clear_all(&self) {
         let mut stdout = stdout();
         queue!(stdout, terminal::Clear(ClearType::All)).unwrap();
         stdout.flush().expect("flush");
@@ -852,11 +978,12 @@ impl Editor {
     */
     async fn draw(&mut self) {
         let start = time::Instant::now();
+        let is_file_empty = self.code.file_name.is_empty();
 
-        if self.code.file_name.is_empty() {
+        if is_file_empty {
             queue!(stdout(), cursor::Hide);
             if self.tree_view.is_search(){ queue!(stdout(), cursor::Show); }
-            self.tree_view.draw();
+            self.tree_view.draw(is_file_empty);
             // self.draw_logo();
             self.draw_status();
             self.tree_view.draw_search();
@@ -864,7 +991,7 @@ impl Editor {
             return;
         }
 
-        self.tree_view.draw();
+        self.tree_view.draw(is_file_empty);
         self.draw_cursor();
         self.tree_view.draw_search();
 
@@ -944,7 +1071,10 @@ impl Editor {
 
             let is_overlayed = self.overlay_lines.contains(&row);
 
+            let mut ccol = 0;
+
             for (col, ch) in chars.enumerate() {
+                // ccol += 1;
                 let outside_left = self.x > col;
                 let outside_right = col >= self.width - self.lp_width - self.ln_width - self.lns_width  + self.x - 1 - tabs_offset;
 
@@ -959,13 +1089,11 @@ impl Editor {
                     });
 
                 let fg_color = match color_range {
-                    Some((_, _, _, _, color)) => *color,
-                    None => Color::Reset,
+                    Some((_, _, _, _, color)) => *color, None => Color::Reset,
                 };
 
                 let bg_color = match self.selection.is_selected(row + self.y, col) {
-                    true => self.selcolor,
-                    false => Color::Reset,
+                    true => self.selcolor, false => Color::Reset,
                 };
 
                 let chr = if ch == '\t' {
@@ -974,12 +1102,26 @@ impl Editor {
                     else { " ".to_string() }
                 } else { ch.to_string() };
 
-                if last_fg_color == fg_color && last_bg_color == bg_color {
-                    queue!(stdout, Print(chr)).unwrap();
-                } else {
-                    queue!(stdout, BColor(bg_color), FColor(fg_color), Print(chr)).unwrap();
-                    last_fg_color = fg_color;
-                    last_bg_color = bg_color;
+                for ch in chr.chars() {
+                    ccol += 1;
+                    // let cell = crate::screen::Cell::new(ch, fg_color, bg_color);
+                    // if self.screen_buffer.cell_equal(col, row, &cell) {
+                    //     queue!(stdout, cursor::MoveRight(1)).unwrap();
+                    //     stdout.flush();
+                    //     // nothing to do
+                    // } else {
+                    //     queue!(stdout, BColor(bg_color), FColor(fg_color), Print(ch)).unwrap();
+                    //     stdout.flush();
+                    //     self.screen_buffer.set_cell(col, row, cell);
+                    // }
+
+                    if last_fg_color == fg_color && last_bg_color == bg_color {
+                        queue!(stdout, Print(ch)).unwrap();
+                    } else {
+                        queue!(stdout, BColor(bg_color), FColor(fg_color), Print(ch)).unwrap();
+                        last_fg_color = fg_color;
+                        last_bg_color = bg_color;
+                    }
                 }
 
                 bytes_counter += ch.len_utf8();
@@ -991,8 +1133,22 @@ impl Editor {
                 self.draw_error(error_message, rrow, row)
             };
 
+            if self.lp_width + self.ln_width + self.lns_width + ccol  < self.width - 1 {
+                for c in ccol..self.width-1 {
+                    let cell = crate::screen::Cell::new(' ', Color::Reset, Color::Reset);
+                    self.screen_buffer.set_cell(c, row, cell);
+                }
+                queue!(stdout, BColor(Color::Reset), terminal::Clear(ClearType::UntilNewLine));
+            }
             // if row < self.height -1{
-                queue!(stdout, BColor(Color::Reset), terminal::Clear(ClearType::UntilNewLine)).unwrap();
+                // queue!(
+                //     stdout, 
+                //     // cursor::MoveTo((self.lp_width + self.ln_width + self.lns_width + ccol) as u16, row as u16),
+                //     BColor(Color::Reset), 
+                //     terminal::Clear(ClearType::UntilNewLine)
+                // ).unwrap();
+                stdout.flush();
+                1;
                 // for some reason status line flickering effect
             // }
 
@@ -1025,6 +1181,8 @@ impl Editor {
                 queue!(stdout, Print(' ')).unwrap();
             }
         }
+
+        // debug!("screen buffer {:?}", self.screen_buffer);
 
         self.draw_status();
         self.draw_cursor();
@@ -1223,6 +1381,50 @@ impl Editor {
             self.r += 1;
             self.fit_cursor();
             self.handle_movement();
+        }
+    }
+
+    fn handle_page_up(&mut self) {
+        if self.y > 0 {
+            // Move view up by a page
+            self.y = if self.y > self.height {
+                self.y - self.height
+            } else {
+                0
+            };
+            // Move cursor up by a page
+            self.r = if self.r > self.height {
+                self.r - self.height
+            } else {
+                0
+            };
+            self.fit_cursor();
+            self.upd = true;
+        }
+    }
+
+    fn handle_page_down(&mut self) {
+        let max_y = if self.code.len_lines() > self.height {
+            self.code.len_lines() - self.height
+        } else {
+            0
+        };
+        
+        if self.y < max_y {
+            // Move view down by a page
+            self.y = if self.y + self.height < max_y {
+                self.y + self.height
+            } else {
+                max_y
+            };
+            // Move cursor down by a page
+            self.r = if self.r + self.height < self.code.len_lines() {
+                self.r + self.height
+            } else {
+                self.code.len_lines() - 1
+            };
+            self.fit_cursor();
+            self.upd = true;
         }
     }
 
@@ -1616,6 +1818,7 @@ impl Editor {
     fn save(&mut self) {
         self.code.save_file().expect("Can not save file");
         self.upd = true;
+        self.self_update = false;
     }
 
     async fn undo(&mut self) {
@@ -1653,7 +1856,7 @@ impl Editor {
 
                             for ch in text.chars() { match ch {
                                 '\n' => { r -= 1; c = 0;}
-                                _ => c -= 1,
+                                _ => c = c.saturating_sub(1),
                             }}
                             if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
                                 lsp.lock().await.did_change(
@@ -1671,6 +1874,61 @@ impl Editor {
         }
         self.upd = true;
     }
+
+    async fn redo(&mut self) {
+        let maybe_change = self.code.redo();
+        match maybe_change {
+            Some(changes) => {
+                for change in changes.changes {
+                    self.r = change.row;
+                    self.c = change.column;
+                    let text = &change.text;
+
+                    match change.operation {
+                        crate::code::Operation::Insert => {
+                            let r = change.row;
+                            let c = change.column;
+                            let mut r_end = r;
+                            let mut c_end = c;
+
+                            for ch in text.chars() { match ch {
+                                '\n' => { r_end += 1; c_end = 0;}
+                                _ => c_end += 1,
+                            }}
+
+                            self.c += 1;
+
+                            if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
+                                lsp.lock().await.did_change(
+                                    r, c, r_end, c_end, &self.code.abs_path, &change.text
+                                ).await;
+                            }
+                        },
+                        crate::code::Operation::Remove => {
+                            let mut r = change.row;
+                            let mut c = change.column;
+
+                            for ch in text.chars() { match ch {
+                                '\n' => { r -= 1; c = 0;}
+                                _ => c -= 1,
+                            }}
+                            if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
+                                lsp.lock().await.did_change(
+                                    r, c, r, c, &self.code.abs_path, ""
+                                ).await;
+                            }
+                        }
+                        crate::code::Operation::Start => {},
+                        crate::code::Operation::End => {},
+                    }
+                }
+            },
+            None => {},
+        }
+        self.upd = true;
+        self.clean_diagnostics();
+    }
+
     async fn local_search(&mut self) {
         let mut end = false;
         let mut changed = false;
@@ -1902,8 +2160,21 @@ impl Editor {
             let dir = utils::current_dir();
             lsp.init(&dir).await;
 
-            lsp.did_open(&lang, &abs_file, &file_content);
+            lsp.did_open(&lang, &abs_file, &file_content, false);
         });
+    }
+    
+    pub async fn lsp_update(&mut self) {
+        let lang = self.code.lang.clone();
+        let lsp = self.lang2lsp.get(&lang);
+        match lsp {
+            Some(lsp) => {
+                let mut lsp = lsp.lock().await;
+                let file_content = self.code.text.to_string();
+                lsp.did_open(&self.code.lang, &self.code.abs_path, &file_content, true);
+            },
+            None => {},
+        }
     }
 
     pub fn clean_diagnostics(&mut self) {

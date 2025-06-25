@@ -1,7 +1,6 @@
 /target
 .DS_Store
 .idea
-.vscode
 flamegraph.svg
 test/__pycache__
 graph.png

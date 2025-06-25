@@ -138,3 +138,16 @@ impl CursorHistory {
         self.positions.clear();
     }
 }
+
+
+struct Cell {
+    character: char,
+    fg_color: crossterm::style::Color,
+    bg_color: crossterm::style::Color,
+}
+
+struct ScreenBuffer {
+    width: usize,
+    height: usize,
+    cells: Vec<Vec<Cell>>,
+}

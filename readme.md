@@ -170,7 +170,7 @@ In the following test cases, the performance of `red` is compared to other popul
 | Test Case              | `red` | `nvim` | `nvim (astro)` | `helix` | `red+alacritty`|`red+alacritty +rust-analyzer` | `idea` | `red+mac terminal` | `red+iterm` |
 | ---------------------- |-------|--------|----------------|---------| ---------------| -------- |  ----- | ------------------ | ----------- |
 | Cursor movement, cpu % | 0.5   | 5      | 6              | 4       |     0.4 + 12   | | 60     |       25           |     30      |
-| Arrow scrolling, cpu % | 3   | 7      | 20             | 6       |     3+20       | | 65     |       40           |     50      |
+| Arrow scrolling, cpu % | 3     | 7      | 20             | 6       |     3+20       | | 65     |       40           |     50      |
 | Mouse scrolling, cpu % | 15    | 30     | 45             | 30      |     20+30      | | 55     |       60           |     130     |
 | Text editing,    cpu % | 5     | 10     | 30             | 8       |     4+20       | 4+20+70  | 600  |   40        |     45      |
 

@@ -24,7 +24,8 @@ pub struct Code {
     pub lang: String,
     pub text: ropey::Rope,
     pub changed: bool,
-    pub history: Vec<Change>,
+    pub undo_history: Vec<Change>,
+    pub redo_history: Vec<Change>,
     tree: Option<tree_sitter::Tree>,
     parser: Option<tree_sitter::Parser>,
     query: Option<tree_sitter::Query>,
@@ -41,7 +42,8 @@ impl Code {
             file_name: String::new(),
             abs_path: String::new(),
             changed: false,
-            history: Vec::new(),
+            undo_history: Vec::new(),
+            redo_history: Vec::new(),
             tree: None,
             lang: String::new(),
             parser: None,
@@ -86,6 +88,7 @@ impl Code {
             "python" => tree_sitter_python::LANGUAGE.into(),
             "go" => tree_sitter_go::LANGUAGE.into(),
             "html" => tree_sitter_html::LANGUAGE.into(),
+            "css" => tree_sitter_css::LANGUAGE.into(),
             "shell" => tree_sitter_bash::LANGUAGE.into(),
             // "toml" => tree_sitter_toml::language().into(),
             "java" => tree_sitter_java::LANGUAGE.into(),
@@ -98,7 +101,7 @@ impl Code {
             "yaml" => tree_sitter_yaml::language().into(),
             "toml" => tree_sitter_toml_ng::LANGUAGE.into(),
 
-             _ => {
+            _ => {
                 lang = "text".to_string();
                 tree_sitter_rust::LANGUAGE.into()
             }
@@ -110,7 +113,8 @@ impl Code {
                 file_name,
                 abs_path,
                 changed: false,
-                history: Vec::new(),
+                undo_history: Vec::new(),
+                redo_history: Vec::new(),
                 tree:None,
                 lang,
                 parser: None,
@@ -127,27 +131,30 @@ impl Code {
 
         let tree = parser.parse(text.to_string(), None);
 
-        // debug
-        // let query_pattern = r#"
-        // (string_literal) @string
-        // (function_item name: (identifier) @function)
-        // "fn" @keyword
-        // "#;
+        let query_highlight_content = crate::config::get_file_content(
+            format!("langs/{}/highlights.scm", lang).as_str()
+        ).unwrap_or("".to_string());
 
-        let red_home = std::env::var("RED_HOME").unwrap_or("./".to_string());
-
-        let lang_highlights = Path::new(&red_home).join("langs").join(lang.clone()).join("highlights.scm");
-        let err_message = format!("Failed to read highlights.scm file: {:?}", lang_highlights);
-        let query_pattern = fs::read_to_string(lang_highlights).expect(&err_message.as_str());
-        let query = match Query::new(&language, &query_pattern) {
+        let query_highlight = match Query::new(&language, &query_highlight_content) {
             Ok(q) => Some(q),
             Err(e) => { debug!("err {}", e); None },
         };
+        
+        let query_test_path = Path::new(".").join("langs")
+            .join(lang.clone()).join("tests.scm");
 
-        let scm = Path::new(&red_home).join("langs").join(lang.clone()).join("tests.scm");
-        let query_test = match fs::read_to_string(scm) {
-            Ok(qp) => Query::new(&language, &qp).ok(),
-            Err(_) => None,
+        let query_test_content = crate::config::get_file_content(
+            query_test_path.to_str().unwrap_or("")
+        );
+
+        let query_test = match query_test_content {
+            Ok(query_test_content) => {
+                match Query::new(&language, &query_test_content) {
+                    Ok(q) => Some(q),
+                    Err(e) => { debug!("err {}", e); None },
+                }
+            }
+            Err(e) => { debug!("err {}", e); None },
         };
 
         let mut this = Self {
@@ -155,11 +162,12 @@ impl Code {
             file_name,
             abs_path,
             changed: false,
-            history: Vec::new(),
+            undo_history: Vec::new(),
+            redo_history: Vec::new(),
             tree,
             lang,
             parser: Some(parser),
-            query,
+            query: query_highlight,
             r: 0, c: 0, x: 0, y: 0,
             lang_conf,
             line2runneble: HashMap::new(),
@@ -169,6 +177,19 @@ impl Code {
         this.update_runnables();
         Ok(this)
     }
+    
+    pub fn reload(&mut self) -> std::io::Result<()>{
+        let file = File::open(&self.abs_path)?;
+        let text = Rope::from_reader(BufReader::new(file))?;
+        
+        let last_row =  self.text.len_lines() - 1;
+        let last_col = self.line_len(last_row);
+        
+        self.replace_text(0, 0, last_row, last_col, &text.to_string());
+        
+        Ok(())
+    }
+    
     pub fn set_lang(&mut self, lang:String, conf: &Config) {
         self.lang = lang;
         let lang_conf = conf.language.iter().find(|l| l.name == self.lang);
@@ -216,12 +237,14 @@ impl Code {
         let from = self.text.line_to_char(row) + column;
         self.insert(text, from);
 
-        self.history.push(Change {
+        self.undo_history.push(Change {
             start: from,
             operation: Operation::Insert,
             text: text.to_string(),
             row, column
         });
+        
+        self.redo_history.clear();
     }
 
     pub fn insert_char(&mut self, c: char, row: usize, column: usize) {
@@ -263,21 +286,48 @@ impl Code {
         let from = self.text.line_to_char(row) + col;
         let to = self.text.line_to_char(row1) + col1;
         let text = self.text.slice(from..to).to_string();
-
-        self.history.push(Change {
+        
+        self.remove(from, to);
+        
+        self.undo_history.push(Change {
             start: from,
             operation: Operation::Remove,
             text: text.to_string(),
             row:row1, column:col1
         });
-
-        self.remove(from, to);
+        
+        self.redo_history.clear();
     }
-
+    
     pub fn remove_char(&mut self, row: usize, column: usize) {
         self.remove_text(row, column-1, row, column);
     }
-
+    
+    pub fn replace_text(&mut self, row: usize, col: usize, row1: usize, col1: usize, text: &str) {
+        let from = self.text.line_to_char(row) + col;
+        let to = self.text.line_to_char(row1) + col1;
+        let removed_text = self.text.slice(from..to).to_string();
+        
+        self.undo_history.push(Change {
+            start: from,
+            operation: Operation::Start,
+            text: "".to_string(),
+            row: row1, column: col1
+        });
+        
+        self.remove_text(row, col, row1, col1);
+        self.insert_text(text, row, col);
+        
+        self.undo_history.push(Change {
+            start: from,
+            operation: Operation::End,
+            text: "".to_string(),
+            row: row1, column: col1
+        });
+        
+        self.redo_history.clear();
+    }
+    
     fn apply_edit(&mut self, edit: InputEdit) {
         match self.tree.as_mut() {
             Some(tree) => {
@@ -308,6 +358,16 @@ impl Code {
         }
     }
 
+    fn set_text(&mut self, text: &str) {
+        self.text = Rope::from(text);
+        
+        if let Some(parser) = &mut self.parser {
+            let tree = parser.parse(self.text.to_string(), None);
+            self.tree = tree;
+            self.update_runnables();
+        }
+    }
+    
     pub fn get_text(&mut self, row: usize, col: usize, row1: usize, col1: usize) -> String {
         let from = self.text.line_to_char(row) + col;
         let to = self.text.line_to_char(row1) + col1;
@@ -392,7 +452,6 @@ impl Code {
     }
 
     pub fn search(&self, substring: &str) -> Vec<(usize, usize)> {
-
         let rope_slice = &self.text.slice(0..);
         let result: Vec<(usize, usize)> = SearchIter::from_rope_slice(rope_slice, substring)
             .map(|(pos, _)| Self::position_to_point(rope_slice, pos))
@@ -960,7 +1019,7 @@ mod code_rope_search_tests {
 }
 
 // Enum to represent different types of operations
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Operation {
     Insert,
     Remove,
@@ -969,7 +1028,7 @@ pub enum Operation {
 }
 
 // Change struct to represent a single change operation
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Change {
     pub start: usize,
     pub operation: Operation,
@@ -990,7 +1049,7 @@ impl Code {
         let mut multiple = false;
 
         while !end {
-            match self.history.pop() {
+            match self.undo_history.pop() {
                 None => return None,
                 Some(change) => {
                     match change.operation {
@@ -998,12 +1057,48 @@ impl Code {
                             let from = change.start;
                             let to = from + change.text.chars().count();
                             self.remove(from, to);
-                            multiple_change.changes.push(change);
+                            multiple_change.changes.push(change.clone());
+                            self.redo_history.push(change);
                             if !multiple { return Some(multiple_change) }
                         },
                         Operation::Remove => {
                             self.insert(&change.text, change.start);
-                            multiple_change.changes.push(change);
+                            multiple_change.changes.push(change.clone());
+                            self.redo_history.push(change);
+                            if !multiple { return Some(multiple_change) }
+                        },
+                        Operation::End => multiple = true,
+                        Operation::Start => end = true,
+                    }
+                }
+            }
+        }
+
+        Some(multiple_change)
+    }
+
+    pub fn redo(&mut self) -> Option<MultipleChange> {
+        let mut multiple_change = MultipleChange::default();
+        let mut end = false;
+        let mut multiple = false;
+
+        while !end {
+            match self.redo_history.pop() {
+                None => return None,
+                Some(change) => {
+                    match change.operation {
+                        Operation::Insert => {
+                            self.insert(&change.text, change.start);
+                            multiple_change.changes.push(change.clone());
+                            self.undo_history.push(change);
+                            if !multiple { return Some(multiple_change) }
+                        },
+                        Operation::Remove => {
+                            let from = change.start;
+                            let to = from + change.text.chars().count();
+                            self.remove(from, to);
+                            multiple_change.changes.push(change.clone());
+                            self.undo_history.push(change);
                             if !multiple { return Some(multiple_change) }
                         }
                         Operation::End => multiple = true,
@@ -1011,7 +1106,6 @@ impl Code {
                     }
                 }
             }
-
         }
 
         Some(multiple_change)
@@ -1031,13 +1125,51 @@ mod code_undo_tests {
         buffer.insert_text(" world", 0, 5);
 
         println!("{}", buffer.text.to_string());
-        println!("{:?}", buffer.history);
+        println!("{:?}", buffer.undo_history);
 
         buffer.undo();
 
         println!("{}", buffer.text.to_string());
-        println!("{:?}", buffer.history);
+        println!("{:?}", buffer.undo_history);
 
+    }
+
+    #[test]
+    fn test_code_redo() {
+        let mut buffer = Code::new();
+
+        // Insert initial text
+        buffer.insert_text("hello", 0, 0);
+        buffer.insert_text(" world", 0, 5);
+        assert_eq!(buffer.text.to_string(), "hello world");
+
+        // Undo the last change
+        buffer.undo();
+        assert_eq!(buffer.text.to_string(), "hello");
+
+        // Redo the change
+        buffer.redo();
+        assert_eq!(buffer.text.to_string(), "hello world");
+
+        // Test multiple operations
+        buffer.insert_text("!", 0, 11);
+        assert_eq!(buffer.text.to_string(), "hello world!");
+
+        // Undo multiple times
+        buffer.undo();
+        assert_eq!(buffer.text.to_string(), "hello world");
+        buffer.undo();
+        assert_eq!(buffer.text.to_string(), "hello");
+        buffer.undo();
+        assert_eq!(buffer.text.to_string(), "");
+
+        // Redo multiple times
+        buffer.redo();
+        assert_eq!(buffer.text.to_string(), "hello");
+        buffer.redo();
+        assert_eq!(buffer.text.to_string(), "hello world");
+        buffer.redo();
+        assert_eq!(buffer.text.to_string(), "hello world!");
     }
 }
 
@@ -1068,7 +1200,7 @@ impl Code {
         let line_2 = self.text.slice(line2_start..line2_end).to_string();
         // let text = self.get_text(line_idx, 0, line_idx+1, 0);
 
-        self.history.push(Change {
+        self.undo_history.push(Change {
             start: 0, operation: Operation::Start,
             text: "".to_string(), row:0, column:0
         });
@@ -1078,7 +1210,7 @@ impl Code {
         self.remove_text(line_idx+1, 0, line_idx+1, line_2.chars().count());
         self.insert_text(&line_1, line_idx+1, 0);
 
-        self.history.push(Change {
+        self.undo_history.push(Change {
             start: 0, operation: Operation::End,
             text: "".to_string(), row:0, column:0
         });
@@ -1100,20 +1232,20 @@ mod code_move_line_test {
         let mut buffer = Code::from_str("hello\nworld\na");
 
         println!("{}", buffer.text.to_string());
-        println!("{:?}", buffer.history);
+        println!("{:?}", buffer.undo_history);
 
         buffer.move_line_down(0);
 
         println!("\n-------move hello to world-------------");
         println!("{}", buffer.text.to_string());
-        println!("{:?}", buffer.history);
+        println!("{:?}", buffer.undo_history);
 
         assert_eq!(buffer.text.to_string(), "world\nhello\na");
 
         buffer.undo();
 
         println!("\n--------------------\n{}", buffer.text.to_string());
-        println!("{:?}", buffer.history);
+        println!("{:?}", buffer.undo_history);
         assert_eq!(buffer.text.to_string(), "hello\nworld\na");
     }
 
@@ -1123,12 +1255,12 @@ mod code_move_line_test {
         buffer.insert_text("hello\nworld\na", 0, 0);
 
         println!("{}", buffer.text.to_string());
-        println!("{:?}", buffer.history);
+        println!("{:?}", buffer.undo_history);
 
         buffer.move_line_up(1);
 
         println!("\n--------------------\n{}", buffer.text.to_string());
-        println!("{:?}", buffer.history);
+        println!("{:?}", buffer.undo_history);
 
         assert_eq!(buffer.text.to_string(), "world\nhello\na");
     }

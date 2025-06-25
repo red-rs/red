@@ -235,8 +235,8 @@ impl Lsp {
         self.send_async(message);
     }
 
-    pub fn did_open(&mut self, lang: &str, path: &str, text: &str) {
-        if self.opened.contains(path) { return; }
+    pub fn did_open(&mut self, lang: &str, path: &str, text: &str, force: bool) {
+        if self.opened.contains(path) && !force { return; }
 
         self.opened.insert(path.to_string());
 
@@ -267,6 +267,19 @@ impl Lsp {
         let message = lsp_messages::did_change(
             line, character,
             line_end, character_end,
+            path, text, version,
+        );
+        self.send_async(message);
+    }
+    
+    pub async fn did_change_text(&mut self,
+        path: &str, text: &str,
+    ) { 
+        if !self.is_ready() { return; }
+
+        let version = self.get_next_version(path);
+
+        let message = lsp_messages::did_change_text(
             path, text, version,
         );
         self.send_async(message);
@@ -422,7 +435,7 @@ async fn test_lsp() {
     let file_name = format!("{}/src/main.rs", dir);
     let file_content = std::fs::read_to_string(&file_name).unwrap();
 
-    lsp.did_open(lang, &file_name, &file_content);
+    lsp.did_open(lang, &file_name, &file_content, false);
     println!("after lsp did_open");
 
     sleep(Duration::from_secs(5)).await;
@@ -667,6 +680,29 @@ pub mod lsp_messages {
                             "character": character_end
                         }
                     },
+                    "text": text
+                }
+                ],
+                "textDocument": {
+                    "uri": format!("file://{}", path),
+                    "version": version
+                }
+            }
+        })
+        .to_string()
+    }
+    
+    pub fn did_change_text(
+        path: &str,
+        text: &str,
+        version: usize,
+    ) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/didChange",
+            "params": {
+                "contentChanges": [
+                {
                     "text": text
                 }
                 ],
