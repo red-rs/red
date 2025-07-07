@@ -129,7 +129,7 @@ pub struct Editor {
 
     node_path: Option<NodePath>,
     
-    watcher: Option<notify::FsEventWatcher>,
+    watcher: Option<notify::RecommendedWatcher>,
     self_update: bool
 }
 
