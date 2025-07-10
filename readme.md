@@ -43,7 +43,25 @@ https://t.me/red_rs_editor
 - Cargo: `red` is built using Cargo, Rust's package manager.
 
 ## Installation
+# From releases
 
+Linux:
+```bash
+curl -L https://github.com/red-rs/red/releases/latest/download/red-linux.tar.gz | tar -xz
+sudo mv red /usr/local/bin/
+sudo chmod +x /usr/local/bin/red
+red --help
+
+```
+Macos:
+```bash
+curl -L https://github.com/red-rs/red/releases/latest/download/red-universal-apple-darwin.tar.gz | tar -xz
+sudo mv red /usr/local/bin/
+sudo chmod +x /usr/local/bin/red
+red --version
+```
+
+# From sources
 1. Clone the repository:
    ```bash
    git clone https://github.com/red-rs/red.git
