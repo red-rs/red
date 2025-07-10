@@ -69,12 +69,12 @@ https://t.me/red_rs_editor
    ```bash
    # bash
    echo "export RED_HOME=$(pwd)" >> ~/.bashrc
-   echo "export PATH=$RED_HOME/target/release:$PATH" >> ~/.bashrc
+   echo 'export PATH="$RED_HOME/target/release:$PATH"' >> ~/.bashrc
    source ~/.bashrc
    
    # zsh
    echo "export RED_HOME=$(pwd)" >> ~/.zshrc
-   echo "export PATH=$RED_HOME/target/release:$PATH" >> ~/.zshrc
+   echo 'export PATH="$RED_HOME/target/release:$PATH"' >> ~/.zshrc
    source ~/.zshrc
    ```
 6. Run red:
