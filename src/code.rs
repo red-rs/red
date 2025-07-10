@@ -90,15 +90,14 @@ impl Code {
             "html" => tree_sitter_html::LANGUAGE.into(),
             "css" => tree_sitter_css::LANGUAGE.into(),
             "shell" => tree_sitter_bash::LANGUAGE.into(),
-            // "toml" => tree_sitter_toml::language().into(),
+            "toml" => tree_sitter_toml_ng::LANGUAGE.into(),
             "java" => tree_sitter_java::LANGUAGE.into(),
-            // "kotlin" => tree_sitter_kotlin::LANGUAGE.into(),
             "cpp" => tree_sitter_cpp::LANGUAGE.into(),
             "c" => tree_sitter_c::LANGUAGE.into(),
-            // "zig" => tree_sitter_zig::LANGUAGE.into(),
-            // "lua" => tree_sitter_lua::LANGUAGE.into(),
+            "zig" => tree_sitter_zig::LANGUAGE.into(),
+            "lua" => tree_sitter_lua::LANGUAGE.into(),
             "json" => tree_sitter_json::LANGUAGE.into(),
-            "yaml" => tree_sitter_yaml::language().into(),
+            "yaml" => tree_sitter_yaml::LANGUAGE.into(),
             "toml" => tree_sitter_toml_ng::LANGUAGE.into(),
 
             _ => {
@@ -137,7 +136,10 @@ impl Code {
 
         let query_highlight = match Query::new(&language, &query_highlight_content) {
             Ok(q) => Some(q),
-            Err(e) => { debug!("err {}", e); None },
+            Err(e) => { 
+                debug!("err {}", e); 
+                None 
+            },
         };
         
         let query_test_path = Path::new(".").join("langs")
@@ -414,12 +416,32 @@ impl Code {
         let end_index = self.text.line_to_char(end_index);
         self.text.slice(start_index..end_index)
     }
+    pub fn char_slice(&self, start: usize, end: usize) -> RopeSlice {
+        self.text.slice(start..end)
+    }
 
     pub fn len_lines(&self) -> usize {
         self.text.len_lines()
     }
+    pub fn len_chars(&self) -> usize {
+        self.text.len_chars()
+    }
     pub fn line_to_byte(&self, line: usize) -> usize {
         self.text.line_to_byte(line)
+    }
+    pub fn line_to_char(&self, line_idx: usize) -> usize {
+        self.text.line_to_char(line_idx)
+    }
+    pub fn point(&self, offset: usize) -> (usize, usize) {
+        let row = self.text.char_to_line(offset);
+        let line_start = self.text.line_to_char(row);
+        let col = offset - line_start;
+        (row, col)
+    }
+
+    pub fn offset(&self, row: usize, col: usize) -> usize {
+        let line_start = self.text.line_to_char(row);
+        line_start + col
     }
 
     pub fn is_empty(&self) -> bool {
