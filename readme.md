@@ -90,6 +90,7 @@ https://t.me/red_rs_editor
 - `Control + x` - cut 
 - `Control + d` - duplicate
 - `Control + z` - undo
+- `Control + y` - redo
 - `Control + f` - find
 - `Control + f, type prefix, Control + g` - global find
 - `Control + o` - cursor back
