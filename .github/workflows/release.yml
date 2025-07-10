@@ -1,0 +1,69 @@
+name: Release red
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build for Linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Linux x86_64 binary
+        run: cargo build --release
+
+      - name: Package as tar.gz
+        run: |
+          mkdir -p dist
+          strip target/release/red
+          cp target/release/red dist/
+          tar -czf red-linux.tar.gz -C dist red
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: red-linux.tar.gz
+
+  build-macos:
+    name: Build for macOS Universal
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust targets
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build macOS binaries
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: Create universal binary
+        run: |
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/red \
+            target/x86_64-apple-darwin/release/red \
+            -output dist/red
+
+      - name: Package as tar.gz
+        run: |
+          strip dist/red
+          tar -czf red-universal-apple-darwin.tar.gz -C dist red
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: red-universal-apple-darwin.tar.gz
