@@ -149,7 +149,8 @@ pub struct TreeView {
     root: TreeNode,
 
     selected: usize,
-    x: usize,
+    /// scroll offset 
+    y: usize,
     moving: bool,
     /// Color for tree dir.
     dir_color: Color,
@@ -179,7 +180,7 @@ impl TreeView {
 
         root.expand();
 
-        Self { width: 25, height: 30, dir, upd: true, root, selected:0, x: 0,
+        Self { width: 25, height: 30, dir, upd: true, root, selected:0, y: 0,
             moving: false, dir_color: Color::Reset, file_color: Color::Reset,
             active_file: String::new(), active_file_color: Color::Reset,
             search: FileSearch::new(),
@@ -192,8 +193,8 @@ impl TreeView {
     pub fn set_file_color(&mut self, c: Color) { self.file_color = c; self.upd = true; }
     pub fn set_active_file_color(&mut self, c: Color) { self.active_file_color = c; self.upd = true; }
     pub fn set_moving(&mut self, m: bool) { self.moving = m; self.upd = true; }
-    pub fn set_selected(&mut self, i: usize) { self.selected = i + self.x; self.upd = true; }
-    pub fn set_scroll(&mut self, x: usize) { self.x = x; self.upd = true; }
+    pub fn set_selected(&mut self, i: usize) { self.selected = i + self.y; self.upd = true; }
+    pub fn set_scroll(&mut self, x: usize) { self.y = x; self.upd = true; }
     pub fn is_moving(&mut self) -> bool { self.moving }
     pub fn is_search(&mut self) -> bool { self.search.active }
 
@@ -201,11 +202,11 @@ impl TreeView {
         if self.selected == 0 { return; }
         self.selected -= 1;
 
-        if self.x > self.selected {
-            self.x = self.selected;
+        if self.y > self.selected {
+            self.y = self.selected;
         } else {
-            if self.selected >= self.x + self.height {
-                self.x = self.selected - self.height + 1;
+            if self.selected >= self.y + self.height {
+                self.y = self.selected - self.height + 1;
             }
         }
 
@@ -219,11 +220,11 @@ impl TreeView {
         }
         self.selected += 1;
 
-        if self.x > self.selected {
-            self.x = self.selected;
+        if self.y > self.selected {
+            self.y = self.selected;
         } else {
-            if self.selected >= self.x + self.height {
-                self.x = self.selected - self.height + 1;
+            if self.selected >= self.y + self.height {
+                self.y = self.selected - self.height + 1;
             }
         }
 
@@ -232,17 +233,18 @@ impl TreeView {
     }
 
     pub fn scroll_down(&mut self) {
-        if self.x + self.height > self.root.len() { 
-            return; 
+        let len = self.root.len();
+        let area_height = self.height;
+        if self.y <= len.saturating_sub(area_height) {
+            self.y += 1;
+            self.upd = true;
         }
-
-        self.x += 1;
-        self.upd = true;
     }
-    pub fn scroll_up(&mut self) {
-        if self.x == 0 { return; }
 
-        self.x -= 1;
+    pub fn scroll_up(&mut self) {
+        if self.y == 0 { return; }
+
+        self.y -= 1;
         self.upd = true;
     }
 
@@ -271,7 +273,7 @@ impl TreeView {
         let padding_left = 1;
 
         let iter = TreeNodeIterator::new(&self.root);
-        let iter = iter.skip(self.x).take(self.height);
+        let iter = iter.skip(self.y).take(self.height);
         let mut count = 0;
 
         queue!(stdout, cursor::Hide);
@@ -288,7 +290,7 @@ impl TreeView {
                 else { self.file_color }
             } else { self.dir_color };
 
-            if self.selected == i+ self.x { color = self.active_file_color }
+            if self.selected == i+ self.y { color = self.active_file_color }
 
             for i in 0..padding_left {
                 if col >= self.width-1 { break; }
@@ -368,7 +370,7 @@ impl TreeView {
     pub fn find<'a>(&'a mut self, index: usize) -> Option<&'a mut TreeNode> {
         let mut count = 0;
         let root = &mut self.root;
-        let maybe_node = Self::find_by_index(root, index + self.x, &mut count);
+        let maybe_node = Self::find_by_index(root, index + self.y, &mut count);
         maybe_node
     }
     

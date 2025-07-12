@@ -379,11 +379,12 @@ impl Code {
 
     pub fn line_len(&self, idx: usize) -> usize {
         let line = self.text.line(idx);
-        let chars = line.chars();
-        let len = chars.len();
-
-        // '/n' at the end if len not 0, do not count it
-        if chars.last() == Some('\n') { len - 1 } else { len }
+        let len = line.len_chars();
+        if idx == self.text.len_lines() - 1 {
+            len
+        } else {
+            len.saturating_sub(1)
+        }
     }
 
     pub fn get_line_at(&self, idx: usize) -> Option<RopeSlice> {
@@ -419,7 +420,9 @@ impl Code {
     pub fn char_slice(&self, start: usize, end: usize) -> RopeSlice {
         self.text.slice(start..end)
     }
-
+    pub fn char_to_byte(&self, char_idx: usize) -> usize {
+        self.text.char_to_byte(char_idx)
+    }
     pub fn len_lines(&self) -> usize {
         self.text.len_lines()
     }
@@ -625,6 +628,60 @@ impl Code {
         
         result
 
+    }
+
+    /// Highlights the interval between `start` and `end` char indices.
+    /// Returns a list of (start byte, end byte, token_name) for highlighting.
+    pub fn highlight_interval(
+        &self, start: usize, end: usize, theme: &HashMap<String, String>,
+    ) -> Vec<(usize, usize, Color)> {
+        if start > start { panic!("invalid range")}
+        let Some(query) = &self.query else { return vec![]; };
+        let Some(tree) = &self.tree else { return vec![]; };
+    
+        let mut query_cursor = QueryCursor::new();
+        query_cursor.set_byte_range(start..end);
+    
+        let root_node = tree.root_node();
+        let capture_names = query.capture_names();
+        
+        let mut query_matches = query_cursor.matches(
+            query, root_node, RopeProvider(self.text.slice(..))
+        );
+    
+        let mut unsorted = Vec::new();
+    
+        while let Some(m) = query_matches.next() {
+            for capture in m.captures {
+                let name = capture_names[capture.index as usize];
+                // let node_text = self.text
+                //     .byte_slice(capture.node.start_byte()..capture.node.end_byte()).as_str()
+                //     .unwrap_or_default(); // debug
+
+                if let Some(value) = theme.get(name) {
+                    unsorted.push((
+                        capture.node.start_byte(),
+                        capture.node.end_byte(),
+                        capture.index as usize,
+                        hex_to_color(value)
+                    ));
+                }
+            }
+        }
+    
+        // Sort by length descending, then by capture index
+        unsorted.sort_by(|a, b| {
+            let len_a = a.1 - a.0;
+            let len_b = b.1 - b.0;
+            match len_b.cmp(&len_a) {
+                std::cmp::Ordering::Equal => b.2.cmp(&a.2),
+                other => other,
+            }
+        });
+    
+        unsorted.into_iter()
+            .map(|(start, end, _, value)| (start, end, value))
+            .collect()
     }
 
     fn update_runnables(&mut self) {
