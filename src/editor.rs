@@ -3,54 +3,54 @@ use std::collections::{HashMap, HashSet};
 use std::io::{stdout, Write};
 use std::path::Path;
 use std::time::Instant;
-use std::{fs, time};
-use log2::{debug, info, error};
+use std::time;
+use anyhow::anyhow;
+use log2::{debug};
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind, KeyEventKind
+    DisableMouseCapture, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEvent, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::style::Print;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, ClearType,
+    EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::{
-    cursor,
-    cursor::position,
-    event, execute, queue,
+    cursor, execute, queue,
     style::{Color, SetBackgroundColor as BColor, SetForegroundColor as FColor},
     terminal,
 };
-
+use crossterm::cursor::{SetCursorStyle};
 use futures::{future::FutureExt, select, StreamExt};
 
-use crate::code::{Code, NodePath, Runnable};
+use crate::code::{Code, NodePath};
 use crate::config::Config;
-use crate::search::search::FileSearchResult;
 use crate::search::{Search, SearchResult};
 use crate::lsp::{self, Lsp};
-use crate::lsp::lsp_messages::{CompletionItem, Diagnostic, DiagnosticParams, HoverResult, ReferencesResult};
+use crate::lsp::lsp_messages::{CompletionItem, Diagnostic, DiagnosticParams, ReferencesResult};
 
 use crate::process::Process;
 use crate::selection::Selection;
-use crate::utils::{CursorHistory, CursorPosition};
-use crate::{search, utils};
+use crate::utils::{CursorHistory, CursorPosition, score_matches, ClickType};
+use crate::{search::{search_in_directory}, utils};
 use crate::tree;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::sync::mpsc::Receiver;
 use tokio::sync::Mutex;
-
 use std::sync::Arc;
+use notify::{recommended_watcher, RecursiveMode, Watcher, event::ModifyKind};
+use crate::screen::Rect;
+use std::cell::RefCell;
+use tokio::sync::mpsc;
 
-use copypasta::{ClipboardContext, ClipboardProvider};
-use crate::screen::ScreenBuffer;
+// keyword and ratatui style
+type Theme = HashMap<String, String>;
+// start byte, end byte, style
+type Hightlight = (usize, usize, Color);
+// start offset, end offset
+type HightlightCache = HashMap<(usize, usize), Vec<Hightlight>>;
 
-use notify::{
-    recommended_watcher, RecursiveMode, Watcher,
-    event::AccessKind, event::AccessMode, event::ModifyKind,
-};
 
 /// Represents a text editor.
 pub struct Editor {
@@ -58,35 +58,28 @@ pub struct Editor {
     config: Config,
     /// Text buffer to display.
     code: Code,
+    /// Local clipboard
+    clipboard: Option<String>,
     /// Terminal height.
     height: usize,
     /// Terminal width.
     width: usize,
-    /// Screen buffer.
-    screen_buffer: ScreenBuffer,
     /// Cursor row.
     r: usize,
     /// Cursor column.
     c: usize,
-    /// Cursor row offset.
+    /// Scroll row offset.
     x: usize,
-    /// Cursor column offset.
+    /// Scroll column offset.
     y: usize,
-
     /// Left panel width
     lp_width: usize,
-    /// Line number width.
-    ln_width: usize,
-    /// Line number to text space.
-    lns_width: usize,
-
     /// Update screen flag.
     upd: bool,
-    upd_next: bool,
-
     /// Theme for syntax highlighting and etc
     theme: HashMap<String, String>,
-
+    /// Cache forghighlights intervals
+    highlights_cache: RefCell<HightlightCache>,
     /// Color for line number.
     lncolor: Color,
     /// Color for status line.
@@ -95,6 +88,8 @@ pub struct Editor {
     selcolor: Color,
     /// Color for errors.
     ecolor: Color,
+    /// Color for line buttons.
+    lbcolor: Color,
 
     /// Mouse selection range.
     selection: Selection,
@@ -121,36 +116,39 @@ pub struct Editor {
 
     overlay_lines: HashSet<usize>,
 
-    /// cursor position between files switches and mouse clicks
+    /// cursor history
     cursor_history: CursorHistory,
-    cursor_history_undo: CursorHistory,
 
     is_lp_focused: bool,
 
     node_path: Option<NodePath>,
-    
+
     watcher: Option<notify::RecommendedWatcher>,
-    self_update: bool
+    self_update: bool,
+
+    last_click: Option<(Instant, usize)>,
+    last_last_click: Option<(Instant, usize)>,
+
+    hovered_runnable_line: Option<usize>,
 }
 
 impl Editor {
-    pub fn new(dir: String, config: Config) -> Self {
+    pub fn new(config: Config) -> Self {
         Editor {
             config,
             code: Code::new(),
+            clipboard: None,
             height: 0,
             width: 0,
-            screen_buffer: ScreenBuffer::new(0, 0),
-            ln_width: 5,
-            lns_width: 5,
             r: 0, c: 0, x: 0, y: 0,
             lncolor: Color::Reset,
             scolor: Color::Reset,
             selcolor: Color::Reset,
             ecolor: Color::Reset,
+            lbcolor: Color::Reset,
             upd: true,
-            upd_next: false,
             theme: HashMap::new(),
+            highlights_cache: RefCell::new(HashMap::new()),
             selection: Selection::new(),
             process: Process::new(),
             lang2lsp: HashMap::new(),
@@ -160,14 +158,16 @@ impl Editor {
             tree_view: tree::TreeView::new(".".to_string()),
             lp_width: 0,
             codes: HashMap::new(),
-            search:Search::new(),
+            search: Search::new(),
             overlay_lines: HashSet::new(),
             cursor_history: CursorHistory::new(),
-            cursor_history_undo: CursorHistory::new(),
             is_lp_focused: false,
             node_path: None,
             watcher: None,
             self_update: false,
+            last_click: None,
+            last_last_click: None,
+            hovered_runnable_line: None,
         }
     }
 
@@ -179,11 +179,9 @@ impl Editor {
                 self.code = code;
                 self.r = 0; self.c = 0; self.y = 0; self.x = 0;
                 self.selection.clean();
-                execute!(stdout(), crossterm::cursor::SetCursorStyle::BlinkingBar)
-                    .expect("Could not set cursor style");
-
+                self.reset_highlight_cache();
             }
-            Err(e) => {},
+            Err(_) => {},
         }
     }
 
@@ -192,10 +190,12 @@ impl Editor {
         self.is_lp_focused = true;
         self.resize(self.width, self.height);
     }
+
     pub fn close_left_panel(&mut self) {
         self.lp_width = 0;
         self.resize(self.width, self.height);
     }
+
     pub fn left_panel_toggle(&mut self) {
         if self.lp_width > 0 { self.lp_width = 0; }
         else { self.lp_width = self.config.left_panel_width.unwrap_or(25); }
@@ -205,36 +205,46 @@ impl Editor {
         self.upd = true;
     }
 
-    pub fn init(&mut self) {
-        execute!(stdout(), EnterAlternateScreen).expect("Could not EnterAlternateScreen");
-        execute!(stdout(), EnableMouseCapture).expect("Could not EnableMouseCapture");
-        enable_raw_mode().expect("Could not turn on Raw mode");
-        execute!(stdout(), cursor::Hide).expect("Could not hide cursor");
-        stdout().flush().expect("Could not flush");
-        let (w, h) = terminal::size().expect("Could not get screen size");
-        self.resize(w as usize, h as usize);
-        self.tree_view.set_width(self.lp_width);
-
-        self.configure_theme();
+    pub fn get_line_number_width(&self) -> usize {
+        let total_lines = self.code.len_lines();
+        let max_line_number = total_lines.max(1);
+        let line_number_digits = max_line_number.to_string().len().max(5);
+        line_number_digits + 2
     }
 
-    pub fn deinit() {
-        disable_raw_mode().expect("Unable to disable_raw_mode");
-        execute!(stdout(), LeaveAlternateScreen).expect("Unable to LeaveAlternateScreen");
-        execute!(stdout(), DisableMouseCapture).expect("Unable DisableMouseCapture");
-        queue!(stdout(), cursor::Show).expect("Unable to show cursor");
+    pub fn init(&mut self) -> anyhow::Result<()> {
+        execute!(stdout(), EnterAlternateScreen)?;
+        execute!(stdout(), EnableMouseCapture)?;
+        enable_raw_mode()?;
+        execute!(stdout(), cursor::Hide)?;
+        execute!(stdout(), SetCursorStyle::DefaultUserShape)?;
+        stdout().flush()?;
+
+        let (w, h) = terminal::size()?;
+        self.resize(w as usize, h as usize);
+        self.tree_view.set_width(self.lp_width);
+        self.configure_theme();
+        Ok(())
+    }
+
+    pub fn deinit() -> anyhow::Result<()> {
+        disable_raw_mode()?;
+        execute!(stdout(), LeaveAlternateScreen)?;
+        execute!(stdout(), DisableMouseCapture)?;
+        queue!(stdout(), cursor::Show)?;
+        Ok(())
     }
 
     pub fn handle_panic(&self) {
         let default_panic = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            Self::deinit();
+            Self::deinit().expect("Error deinit");
             default_panic(info);
             std::process::exit(1);
         }));
 
         ctrlc::set_handler(move || {
-            Self::deinit();
+            Self::deinit().expect("Error deinit");
         })
         .expect("Error setting Ctrl-C handler");
     }
@@ -243,43 +253,53 @@ impl Editor {
         let theme_path = &self.config.theme;
         let theme_content = crate::config::get_file_content(theme_path).unwrap();
         let theme_yaml = serde_yaml::from_str(&theme_content)
-            .expect("Failed to parse theme yaml file ");
+            .expect("Failed to parse theme yaml file");
         self.theme = utils::yaml_to_map(theme_yaml);
 
-        self.lncolor = self.theme.get("lncolor").map(|c| utils::hex_to_color(c)).unwrap_or(Color::AnsiValue(247));
-        self.scolor = self.theme.get("scolor").map(|c| utils::hex_to_color(c)).unwrap_or(Color::AnsiValue(247));
-        self.selcolor = self.theme.get("selcolor").map(|c| utils::hex_to_color(c)).unwrap_or(Color::AnsiValue(247));
-        self.ecolor = self.theme.get("ecolor").map(|c| utils::hex_to_color(c)).unwrap_or(Color::AnsiValue(247));
+        self.lncolor = self.theme.get("lncolor").map(|c| utils::hex_to_color(c))
+            .unwrap_or(Color::AnsiValue(247));
+        self.scolor = self.theme.get("scolor").map(|c| utils::hex_to_color(c))
+            .unwrap_or(Color::AnsiValue(247));
+        self.selcolor = self.theme.get("selcolor").map(|c| utils::hex_to_color(c))
+            .unwrap_or(Color::AnsiValue(247));
+        self.ecolor = self.theme.get("ecolor").map(|c| utils::hex_to_color(c))
+            .unwrap_or(Color::AnsiValue(247));
+        self.lbcolor = self.theme.get("lbcolor").map(|c| utils::hex_to_color(c))
+            .unwrap_or(Color::AnsiValue(87));
 
-        let dircolor = self.theme.get("dircolor").map(|c| utils::hex_to_color(c)).unwrap_or(Color::Reset);
-        self.tree_view.set_dir_color(dircolor);
-        let filecolor = self.theme.get("filecolor").map(|c| utils::hex_to_color(c)).unwrap_or(Color::Reset);
-        self.tree_view.set_file_color(filecolor);
-        let activefilecolor = self.theme.get("activefilecolor").map(|c| utils::hex_to_color(c)).unwrap_or(Color::Reset);
-        self.tree_view.set_active_file_color(activefilecolor);
+        let dircolor = self.theme.get("dircolor").map(|c| utils::hex_to_color(c));
+        self.tree_view.set_dir_color(dircolor.unwrap_or(Color::Reset));
+
+        let filecolor = self.theme.get("filecolor").map(|c| utils::hex_to_color(c));
+        self.tree_view.set_file_color(filecolor.unwrap_or(Color::Reset));
+
+        let activefilecolor = self.theme.get("activefilecolor").map(|c| utils::hex_to_color(c));
+        self.tree_view.set_active_file_color(activefilecolor.unwrap_or(Color::Reset));
     }
 
     pub async fn start(&mut self) {
-        self.init();
+        let init_result = self.init();
+        if let Err(e) = init_result {
+            eprintln!("Cannot init screen {:?}", e);
+            return;
+        }
 
         self.draw().await;
 
-        let (diagnostic_send, mut diagnostic_rx) = tokio::sync::mpsc::
-            channel::<DiagnosticParams>(1);
+        let (diagnostic_send, mut diagnostic_rx) = mpsc::channel::<DiagnosticParams>(1);
         self.diagnostics_sender = Some(diagnostic_send.clone());
 
         self.init_new_lsp();
-        
-        let (watch_tx, mut watch_rx) = tokio::sync::mpsc::
-            channel::<notify::Result<notify::Event>>(32);
-        
+
+        let (watch_tx, mut watch_rx) = mpsc::channel::<notify::Result<notify::Event>>(32);
+
         let mut watcher = recommended_watcher(move |res| {
             let _ = watch_tx.blocking_send(res);
         }).unwrap();
-        
+
         let p = Path::new(&self.code.abs_path);
-        watcher.watch(p, RecursiveMode::Recursive);
-        
+        let _ = watcher.watch(p, RecursiveMode::Recursive);
+
         self.watcher = Some(watcher);
 
         let mut reader = EventStream::new();
@@ -303,50 +323,45 @@ impl Editor {
             };
         }
     }
-    
-    async fn handle_watch_event(&mut self, res: Result<notify::Event, notify::Error>) {
+
+    async fn handle_watch_event(
+        &mut self, res: Result<notify::Event, notify::Error>
+    ) {
         match res {
             Ok(event) => {
                 // println!("File event: {:?}", event);
-                
                 match event.kind {
 
                     notify::EventKind::Modify(ModifyKind::Data(_)) => {
                         let selfpath = Path::new(&self.code.abs_path);
-                        
+
                         if self.self_update {
                             self.self_update = false;
                             return;
                         }
-                        
-                        let is_need_update = event.paths.iter()
-                            .any(|p| p == &selfpath);
-                            
+
+                        let is_need_update = event.paths.iter().any(|p| p == &selfpath);
+
                         if is_need_update {
                             debug!("Self update detected");
-                            self.code.reload();
+                            let _ = self.code.reload();
                             self.lsp_update().await;
                             self.upd = true;
                             self.draw().await;
                         }
                     }
-                    
                     _ => {}
                 }
             }
-            Err(err) => {
-                // eprintln!("Watch error: {:?}", err);
-            }
+            Err(_) => {}
         }
     }
-    
-    fn is_quit_event(
-        &mut self, event: &Event
-    ) -> bool {
+
+    fn is_quit_event(&mut self, event: &Event) -> bool {
         match event {
             Event::Key(e) => {
                 if e.modifiers == KeyModifiers::CONTROL &&
-                   e.code == KeyCode::Char('q') { 
+                   e.code == KeyCode::Char('q') {
                     return true;
                 }
             }
@@ -354,10 +369,8 @@ impl Editor {
         }
         return false;
     }
-    
-    async fn handle_terminal_event(
-        &mut self, event:  Event
-    ){
+
+    async fn handle_terminal_event(&mut self, event: Event) {
         match event {
             Event::Resize(w, h) => {
                 self.resize(w as usize, h as usize);
@@ -369,33 +382,24 @@ impl Editor {
             }
             Event::Key(e) => {
                 #[cfg(target_os = "windows")] { // skip press event on windows
-                    if e.kind == KeyEventKind::Press { 
-                        anyhow::bail!("skip press event on windows") 
+                    if e.kind == KeyEventKind::Press {
+                        anyhow::bail!("skip press event on windows")
                     }
                 };
                 self.handle_keyboard(e).await;
-
                 self.draw().await;
-                if self.upd_next {
-                    self.upd = true;
-                    self.upd_next = false;
-                }
             }
             Event::FocusGained => {}
             Event::FocusLost => {}
             Event::Paste(_) => {}
         }
     }
-    
+
     async fn handle_diagnostic_update(&mut self, upd: DiagnosticParams) {
         let filename = upd.uri.clone();
         self.diagnostics.lock().await.insert(filename, upd);
         self.upd = true;
         self.draw().await;
-    }
-
-    fn is_quit(&self, e: KeyEvent) -> bool {
-        e.modifiers == KeyModifiers::CONTROL && e.code == KeyCode::Char('q')
     }
 
     fn resize(&mut self, w: usize, h: usize) {
@@ -407,18 +411,12 @@ impl Editor {
             self.height = h;
         }
 
-        debug!("resize : {} {}", self.width, self.height);
-
-        let new_width = self.width - self.lp_width - self.ln_width - self.lns_width;
-        // self.screen_buffer.resize(new_width, h);
-        self.screen_buffer = ScreenBuffer::new(new_width, h);
         self.upd = true;
         self.process.update_true();
         self.tree_view.set_height(self.height);
     }
 
     async fn handle_keyboard(&mut self, event: KeyEvent) {
-
         if self.is_lp_focused {
             self.handle_left_panel(event).await;
             return;
@@ -431,92 +429,43 @@ impl Editor {
             if event.code == KeyCode::Down {
                 self.move_line_down().await;
             }
-            
+
             return;
         }
 
         match event.modifiers {
             KeyModifiers::ALT => {
-                let code = event.code;
-                match code {
-                    KeyCode::Up => {
-                        self.select_more();
-                    }
-                    KeyCode::Down => {
-                        self.select_less();
-                    }
-                    // option + arrow left
-                    KeyCode::Left =>  {
-                        // scroll horizontal
-                        // if self.x > 0 { self.x -= 1 }
-                        let line = self.code.line_at(self.r);
-                        if line.is_none() { return; }
-                        let line = line.unwrap();
-                        let next = utils::find_prev_word(line, self.c-1);
-                        self.c = next;
-                    },
-                    // option + arrow right
-                    KeyCode::Right => {
-                        // scroll horizontal
-                        // self.x += 1
-
-                        let line = self.code.line_at(self.r);
-                        if line.is_none() { return; }
-                        let line = line.unwrap();
-                        let next = utils::find_next_word(line, self.c+1);
-                        self.c = next;
-                    },
+                match event.code {
+                    KeyCode::Up => self.select_more(),
+                    KeyCode::Down => self.select_less(),
+                    KeyCode::Left =>  self.handle_left_word(),
+                    KeyCode::Right => self.handle_right_word(),
                     KeyCode::Backspace => self.handle_cut_line().await,
-
                     _ => debug!("event.code {:?}", event.code),
                 }
-                self.upd = true;
                 return;
             }
 
             KeyModifiers::CONTROL => {
                 match event.code {
                     KeyCode::Char('s') => self.save(),
-                    KeyCode::Char('c') => self.copy_to_clipboard(),
+                    KeyCode::Char('c') => self.copy_to_clipboard(None),
                     KeyCode::Char('v') => self.paste_from_clipboard().await,
                     KeyCode::Char('d') => self.handle_duplicate().await,
-                    KeyCode::Char('f') => self.local_search().await,
+                    KeyCode::Char('f') => self.handle_local_search().await,
                     KeyCode::Char('r') => self.references().await,
                     KeyCode::Char('g') => self.definition().await,
                     KeyCode::Char('z') => self.undo().await,
                     KeyCode::Char('y') => self.redo().await,
                     KeyCode::Char('o') => self.undo_cursor().await,
                     KeyCode::Char('p') => self.redo_cursor().await,
-                    KeyCode::Char('g') => {
-                        self.global_search().await;
-                        self.overlay_lines.clear();
-                    },
                     KeyCode::Char('e') => self.handle_errors().await,
                     KeyCode::Char('h') => self.hover().await,
-                    KeyCode::Char('t') => {
-                        if self.lp_width == 0 { 
-                            self.is_lp_focused = true;
-                            self.left_panel_toggle(); 
-                        }
-                        else {
-                            if !self.is_lp_focused {
-                                self.is_lp_focused = true;
-                            } else {
-                                self.is_lp_focused = false;
-                                self.left_panel_toggle();
-                            }
-                        }
-
-                        // self.clear_all();
-                        self.tree_view.upd = true;
-                        self.upd = true;
-                    }
+                    KeyCode::Char('t') => self.toggle_left_panel(),
+                    KeyCode::Char(' ') => self.completion().await,
                     KeyCode::Char('x') => {
-                        self.copy_to_clipboard();
+                        self.copy_to_clipboard(None);
                         self.handle_cut().await;
-                    }
-                    KeyCode::Char(' ') => {
-                        self.lsp_completion().await;
                     }
                     _ => {}
                 }
@@ -530,7 +479,6 @@ impl Editor {
                     if !self.selection.active && !self.selection.keep_once {
                         self.selection.set_start(self.r, self.c);
                     }
-
                     match event.code {
                         KeyCode::Up => self.handle_up(),
                         KeyCode::Down => self.handle_down(),
@@ -538,7 +486,6 @@ impl Editor {
                         KeyCode::Right => self.handle_right(),
                         _ => {}
                     }
-
                     self.selection.set_end(self.r, self.c);
                     self.selection.active = true;
                     self.upd = true;
@@ -548,7 +495,6 @@ impl Editor {
 
             _ => {}
         }
-
 
         match event.code {
             KeyCode::Up => self.handle_up(),
@@ -562,9 +508,7 @@ impl Editor {
             KeyCode::Tab => self.insert_tab().await,
             KeyCode::PageUp => self.handle_page_up(),
             KeyCode::PageDown => self.handle_page_down(),
-            _ => {
-                debug!("event.code {:?}", event.code);
-            }
+            _ => {}
         }
 
 
@@ -575,12 +519,28 @@ impl Editor {
         }
     }
 
+    fn toggle_left_panel(&mut self) {
+        if self.lp_width == 0 {
+            self.is_lp_focused = true;
+            self.left_panel_toggle();
+        }
+        else {
+            if !self.is_lp_focused {
+                self.is_lp_focused = true;
+            } else {
+                self.is_lp_focused = false;
+                self.left_panel_toggle();
+            }
+        }
+        self.tree_view.upd = true;
+        self.upd = true;
+    }
 
     async fn handle_left_panel(&mut self, event: KeyEvent) {
         match event.modifiers {
             KeyModifiers::CONTROL => {
                 if event.code == KeyCode::Char('t') {
-                    // close left panel 
+                    // close left panel
                     self.is_lp_focused = false;
                     self.left_panel_toggle();
                     self.tree_view.upd = true;
@@ -615,11 +575,7 @@ impl Editor {
                     None => {}, Some(node) => {
                         if node.is_file() {
                             let path = node.fullpath();
-                            self.cursor_history.push(CursorPosition{
-                                filename: self.code.abs_path.clone(),
-                                row: self.r, col: self.c, y: self.y, x: self.x,
-                            });
-                            self.tree_view.set_active(path.clone());
+                            self.save_cursor_to_history();
 
                             if self.tree_view.is_search() {
                                 self.tree_view.clear_search();
@@ -627,7 +583,7 @@ impl Editor {
                                 self.tree_view.set_scroll(0);
                                 self.tree_view.find_expand_by_fullpath(&path);
                             }
-                           
+
                             self.open_file(&path).await;
                             self.is_lp_focused = false;
                         }
@@ -645,13 +601,12 @@ impl Editor {
             }
         }
     }
-    
-    async fn open_file(&mut self, path: &String) {
-        if !self.codes.contains_key(path) { // move self.code code to codes buffer
 
-            self.code.set_cursor_position(
-                self.r.clone(), self.c.clone(), self.y.clone(), self.x.clone()
-            );
+    pub async fn open_file(&mut self, path: &String) {
+        let is_open = self.codes.contains_key(path);
+
+        if !is_open {
+            self.code.set_cursor_position(self.r, self.c, self.y, self.x);
 
             let current_code = std::mem::replace(&mut self.code, Code::new());
 
@@ -670,14 +625,11 @@ impl Editor {
                     self.init_new_lsp();
                 },
             }
-            
             if let Some(watcher) = self.watcher.as_mut() {
                 let dir = Path::new(path);
-                watcher.watch(dir, RecursiveMode::NonRecursive);
+                let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
             }
-
-        } else {  // move from codes buffer to self.code
-
+        } else {
             let mut code = self.codes.remove(path).unwrap();
             let (r,c,y,x) = code.get_cursor_position();
 
@@ -691,256 +643,262 @@ impl Editor {
         }
     }
 
+    fn is_on_divider(&self, e: MouseEvent) -> bool {
+        let col = e.column as usize;
+        let line = e.row as usize + self.y;
+
+        let around_line_number = col >= self.lp_width.saturating_sub(1)
+            && col < self.lp_width + 3
+            && !self.code.is_runnable(line);
+
+        let on_left_panel_edge = col > 0 && col == self.lp_width.saturating_sub(1);
+
+        around_line_number
+    }
+
+    fn is_on_runnable_button(&self, col: u16) -> bool {
+        col as usize == self.lp_width
+    }
+
     async fn handle_mouse(&mut self, e: MouseEvent) {
-        match e {
-            MouseEvent { row, column, kind, modifiers } => {
-                self.is_lp_focused = (column as usize) < self.lp_width;
+        self.is_lp_focused = (e.column as usize) < self.lp_width;
 
-                match (modifiers, kind) {
-                    (KeyModifiers::CONTROL, MouseEventKind::Up(_)) => {
-                        self.handle_mouse_click(row as usize, column as usize);
-                        self.definition().await;
-                        return;
-                    },
-                    (KeyModifiers::ALT, MouseEventKind::Up(_)) => {
-                        self.handle_mouse_click(row as usize, column as usize);
-                        self.references().await;
-                        return;
-                    },
-                    _ => {}
-                }
-
-                match kind {
-                    MouseEventKind::Down(button) => match button {
-                        MouseButton::Left => {
-                            let rrow = row as usize;
-                            let ccol = column as usize;
-
-                            // if rrow == self.height-1 && (
-                            //     (ccol == self.width - 9) ||
-                            //     (ccol == self.width - 7) ||
-                            //     (ccol == self.width - 5) ||
-                            //     (ccol == self.width - 3) ||
-                            //     (ccol == self.width - 1) 
-                            // ) { 
-                            //     // button clicked
-                            //     return; 
-                            // }
-
-                            if self.lp_width + self.ln_width < ccol &&
-                                ccol < self.lp_width + self.ln_width + self.lns_width - 1 {
-                                // clicked on run button column
-                                
-                                return;
-                            }
-
-                            if (column as usize) + 1 == self.lp_width {
-                                self.tree_view.set_moving(true);
-                                self.upd = true;
-                                return;
-                            }
-
-                            if self.is_lp_focused {
-                                let maybe_node = self.tree_view.find(row as usize);
-
-                                match maybe_node {
-                                    Some(node) => {
-                                        if node.is_file() {
-                                            let path = node.fullpath();
-                                            self.cursor_history.push(CursorPosition{
-                                                filename: self.code.abs_path.clone(),
-                                                row: self.r, col: self.c, y: self.y, x: self.x,
-                                            });
-                                            self.tree_view.set_active(path.clone());
-                                            self.open_file(&path).await
-                                        }
-                                        else {
-                                            node.toggle();
-                                        }
-
-                                        self.tree_view.set_selected(row as usize);
-                                        self.upd = true;
-                                        self.tree_view.upd = true;
-                                    },
-                                    None => {},
-                                }
-                                return;
-                            }
-
-                            if self.code.file_name.is_empty() { return }
-
-                            let (prev_r, prev_c) = (self.r.clone(), self.c.clone());
-
-                            self.handle_mouse_click(row as usize, column as usize);
-
-                            let is_shift_pressed = modifiers.contains(KeyModifiers::SHIFT);
-
-                            if is_shift_pressed {
-                                let prev_point = crate::selection::Point { y: prev_r as i32, x: prev_c as i32 };
-                                let point = crate::selection::Point { y: self.r as i32, x: self.c as i32 };
-
-
-                                let direction = if point.greater_than(&prev_point) { "down" } else { "up" };
-                                if direction == "down" {
-                                    self.selection.set_end(self.r, self.c);
-                                } else {
-                                    self.selection.set_start(self.r, self.c);
-                                }
-                                self.upd = true;
-                                return;
-                            }
-
-                            if !self.selection.empty() {
-                                self.selection.clean();
-                                self.selection.set_start(self.r, self.c);
-                                self.upd = true;
-                            } else {
-                                self.selection.set_start(self.r, self.c);
-                                self.selection.active = true;
-                                self.selection.keep_once = true;
-                            }
-
-                            if prev_r == self.r && prev_c == self.c && self.selection.empty() {
-                                // double click
-                                let line = self.code.line_at(self.r);
-                                if line.is_none() { return; }
-                                let line = line.unwrap();
-
-                                let prev = utils::find_prev_word(line, self.c);
-                                let next = utils::find_next_word(line, self.c);
-
-                                if prev < self.c && self.c < next { // not first and last symbol
-                                    self.selection.set_start(self.r, prev);
-                                    self.selection.set_end(self.r, next);
-                                    self.selection.active = true;
-                                    self.selection.keep_once = true;
-                                    self.upd = true;
-                                }
-                            }
-                        }
-                        MouseButton::Right => {}
-                        MouseButton::Middle => {}
-                    },
-                    MouseEventKind::ScrollDown => {
-                        if (column as usize) < self.lp_width {
-                            self.tree_view.scroll_down();
-                            // self.upd = true;
-                        } else {
-                            self.scroll_down()
-                        }
-                    },
-                    MouseEventKind::ScrollUp => {
-                        if (column as usize) < self.lp_width {
-                            self.tree_view.scroll_up();
-                            // self.upd = true;
-                        } else {
-                            self.scroll_up()
-                        }
-                    },
-                    MouseEventKind::Up(_) => {
-                        let rrow = row as usize;
-                        let ccol = column as usize;
-
-                        // if rrow == self.height-1 && ccol == self.width - 9 {
-                        //     // left panel button clicked
-                        //     self.left_panel_toggle();
-                        //     self.tree_view.upd = true;
-                        //     self.upd = true;
-                        //     return;
-                        // }
-                        // if rrow == self.height-1 && ccol == self.width - 7 {
-                        //     // search button clicked
-                        //     self.local_search().await;
-                        //     return;
-                        // }
-                        // if rrow == self.height-1 && ccol == self.width - 3 {
-                        //     // last run button clicked
-                        //     self.process.run_last_tmux();
-                        //     return;
-                        // }
-                        // if rrow == self.height-1 && ccol == self.width - 1 {
-                        //     // exit button clicked
-                        //     Editor::deinit();
-                        //     std::process::exit(0);
-                        //     return;
-                        // }
-
-                        let is_runnable_button_clicked = self.lp_width + self.ln_width < ccol &&
-                            ccol < self.lp_width + self.ln_width + self.lns_width - 1;
-
-                        if is_runnable_button_clicked {
-                            match self.code.get_runnable(row as usize + self.y) {
-                                Some(runnable) => self.process.run_tmux(&runnable.cmd),
-                                None => {},
-                            }
-                            return;
-                        }
-
-                        self.cursor_history.push(CursorPosition{
-                            filename: self.code.abs_path.clone(),
-                            row: self.r, col: self.c, y: self.y, x: self.x,
-                        });
-                        self.cursor_history_undo.clear();
-
-
-                        self.tree_view.set_moving(false);
-
-                        if self.selection.active {
-                            self.handle_mouse_click(row as usize, column as usize);
-
-                            if self.selection.empty() {
-                                self.selection.clean();
-                                self.handle_movement();
-                            } else {
-                                self.selection.active = false;
-                                self.selection.keep_once = true;
-                                self.upd = true;
-                            }
-                        }
-                    }
-                    MouseEventKind::Drag(_) => {
-                        if self.tree_view.is_moving() {
-                            if column as usize > self.width - self.ln_width - self.lns_width {
-                                return;
-                            }
-                            self.lp_width = column as usize;
-                            self.tree_view.set_width(column as usize);
-                            self.resize(self.width, self.height);
-                            self.upd = true;
-                            return;
-                        }
-
-                        self.handle_mouse_click(row as usize, column as usize);
-
-                        self.selection.set_end(self.r, self.c);
-                        self.selection.active = true;
-                        self.selection.keep_once = true;
-                        self.upd = true;
-                    }
-                    _ => {}
+        match e.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.is_on_divider(e) {
+                    self.tree_view.set_moving(true);
+                    self.upd = true;
+                    return;
                 }
             }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.tree_view.is_moving() {
+                    let editor_min_width = 20;
+                    let max = self.width.saturating_sub(editor_min_width);
+                    let width = e.column.clamp(1, max as u16) as usize;
+                    self.lp_width = width;
+                    self.tree_view.set_width(width);
+                    self.upd = true;
+                    return;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.tree_view.is_moving() {
+                    self.tree_view.set_moving(false);
+                    self.upd = true;
+                    return;
+                }
+            }
+            _ => {}
+        }
+
+        let line = e.row as usize + self.y;
+
+        // check runnable button first
+        if self.is_on_runnable_button(e.column) && self.code.is_runnable(line) {
+            self.hovered_runnable_line = Some(line);
+            self.draw_run_button(e.row as usize, Color::DarkBlue);
+            self.draw_cursor();
+            if e.kind == MouseEventKind::Up(MouseButton::Left) {
+                if let Some(runnable) = self.code.get_runnable(line) {
+                    self.process.run_tmux(&runnable.cmd);
+                }
+            }
+            return;
+        }
+
+        // if button hovered, draw it back
+        if let Some(prev_line) = self.hovered_runnable_line.take() {
+            if self.code.is_runnable(prev_line) {
+                let y = prev_line - self.y;
+                self.draw_run_button(y as usize, self.lbcolor);
+            }
+            self.draw_cursor();
+        }
+
+        if self.is_lp_focused {
+            self.handle_mouse_tree(e).await;
+        } else {
+            let area = Rect::new(
+                self.lp_width as u16, 0,
+                self.width as u16, self.height as u16,
+            );
+            self.handle_mouse_editor(e, &area).await;
         }
     }
 
-    fn handle_mouse_click(&mut self, row_click: usize, column_click: usize) {
-        self.r = row_click + self.y;
+    async fn handle_mouse_tree(&mut self, e: MouseEvent) {
+        match e.kind {
+            MouseEventKind::ScrollUp => {
+                self.tree_view.scroll_up();
+                self.upd = true;
+            }
+            MouseEventKind::ScrollDown => {
+                self.tree_view.scroll_down();
+                self.upd = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if e.column as usize == self.lp_width.saturating_sub(1) {
+                    self.tree_view.set_moving(true);
+                    self.upd = true;
+                    return;
+                }
 
-        if self.r > self.code.len_lines() - 1 {  // fit to content
-            self.r = self.code.len_lines() - 1;
+                self.tree_view.set_moving(false);
+
+                let maybe_clicked_node = self.tree_view.find_with_depth(e.row as usize);
+
+                if let Some((clicked_node, depth)) = maybe_clicked_node {
+                    let name = clicked_node.name();
+                    let name_width = unicode_width::UnicodeWidthStr::width(name.as_str());
+                    let name_start = 1 + depth as u16;
+                    let end = name_start + name_width as u16;
+
+                    let name_clicked = e.column >= name_start && e.column < end;
+                    if !name_clicked { return; }
+
+                    if clicked_node.is_file() {
+                        let path = clicked_node.fullpath();
+                        self.save_cursor_to_history();
+                        self.tree_view.set_active(path.clone());
+                        self.open_file(&path).await;
+                        self.save_cursor_to_history();
+                    } else {
+                        let _ = clicked_node.toggle();
+                    }
+
+                    self.tree_view.set_selected(e.row as usize);
+                    self.upd = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_mouse_editor(&mut self, e: MouseEvent, area: &Rect) {
+
+        // handle clicks with modifier keys first
+        match (e.modifiers, e.kind) {
+            (KeyModifiers::CONTROL, MouseEventKind::Down(MouseButton::Left)) => {
+                if let Some(cursor) = self.cursor_from_mouse(e.column, e.row, area) {
+                    (self.r, self.c) = self.code.point(cursor);
+                    // self.handle_mouse_click(self.r, self.c);
+                    self.definition().await;
+                    return;
+                }
+            }
+            (KeyModifiers::ALT, MouseEventKind::Down(MouseButton::Left)) => {
+                if let Some(cursor) = self.cursor_from_mouse(e.column, e.row, area) {
+                    (self.r, self.c) = self.code.point(cursor);
+                    // self.handle_mouse_click(self.r, self.c);
+                    self.references().await;
+                    return;
+                }
+            }
+            _ => {}
         }
 
-        if column_click < self.lp_width + self.ln_width + self.lns_width + self.x {
-            self.c = 0; // outside of view
-        } else {
-            self.c = self.find_cursor_x_position(column_click - (self.lp_width + self.ln_width + self.lns_width));
-            // self.c -= self.lp_width + self.ln_width + self.lns_width
-            // self.c = column_click - self.lp_width -self.ln_width - self.lns_width + self.x;
+        match e.kind {
+            MouseEventKind::ScrollUp => self.scroll_up(),
+            MouseEventKind::ScrollDown => self.scroll_down(),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pos = self.cursor_from_mouse(e.column, e.row, area);
+
+                if let Some(cursor) = pos {
+                    let now = Instant::now();
+                    let click_type = ClickType::from_click_history(
+                        now, cursor, self.last_click, self.last_last_click,
+                    );
+                    let (start, end) = match click_type {
+                        ClickType::Triple => self.code.line_boundaries(cursor),
+                        ClickType::Double => self.code.word_boundaries(cursor),
+                        ClickType::Single => (cursor, cursor),
+                    };
+                    self.last_last_click = self.last_click;
+                    self.last_click = Some((now, cursor));
+
+                    let start_point = self.code.point(start);
+                    let end_point = self.code.point(end);
+                    self.selection.set_start(start_point.0, start_point.1);
+                    self.selection.set_end(end_point.0, end_point.1);
+                    self.selection.active = true;
+                    self.upd = true;
+                    self.r = end_point.0;
+                    self.c = end_point.1;
+                    self.save_cursor_to_history();
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let pos = self.cursor_from_mouse(e.column, e.row, area);
+                if let Some(cursor) = pos {
+                    let point = self.code.point(cursor);
+                    self.selection.set_end(point.0, point.1);
+                    self.r = point.0;
+                    self.c = point.1;
+                    self.selection.active = true;
+                    self.upd = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn cursor_from_mouse(
+        &self, mouse_x: u16, mouse_y: u16, area: &Rect
+    ) -> Option<usize> {
+
+        let line_number_width = self.get_line_number_width() as u16;
+
+        if mouse_y < area.top()
+            || mouse_y >= area.bottom()
+            || mouse_x < area.left() + line_number_width
+        {
+            return None;
         }
 
-        if self.c > self.code.line_len(self.r) { // fit to content
-            self.c = self.code.line_len(self.r);
+        let clicked_row = (mouse_y - area.top()) as usize + self.y;
+        if clicked_row >= self.code.len_lines() {
+            return None;
         }
+
+        let clicked_col = (mouse_x - area.left() - line_number_width) as usize;
+
+        let line_start_char = self.code.line_to_char(clicked_row);
+        let line_len = self.code.line_len(clicked_row);
+
+        let start_col = self.x.min(line_len);
+        let end_col = line_len;
+
+        let char_start = line_start_char + start_col;
+        let char_end = line_start_char + end_col;
+
+        let visible_chars = self.code.char_slice(char_start, char_end);
+
+        let mut current_col = 0;
+        let mut char_idx = start_col;
+
+        for _ in visible_chars.chars() {
+            let ch_width = 1;
+            if current_col + ch_width > clicked_col {
+                break;
+            }
+            current_col += ch_width;
+            char_idx += 1;
+        }
+
+        let line = self.code.char_slice(line_start_char, line_start_char + line_len);
+
+        let visual_width: usize = line.chars().map(|ch| 1).sum();
+
+        if clicked_col + self.x >= visual_width {
+            let mut end_idx = line.len_chars();
+            if end_idx > 0 && line.char(end_idx - 1) == '\n' {
+                end_idx -= 1;
+            }
+            char_idx = end_idx;
+        }
+
+        Some(line_start_char + char_idx)
     }
 
     fn status_line(&self) -> String {
@@ -960,31 +918,42 @@ impl Editor {
 
     pub fn clear_all(&self) {
         let mut stdout = stdout();
-        queue!(stdout, terminal::Clear(ClearType::All)).unwrap();
+        let _ = queue!(stdout, terminal::Clear(ClearType::All));
         stdout.flush().expect("flush");
     }
 
-    /*
-       1. Get colors byte ranges from tree-sitter only for visible text
-       2. Iterate over characters and increment bytes_counter
-       3. Find color range that matches bytes_counter
-       4. Draw each char
+    fn cached_highlight_interval(
+        &self, start: usize, end: usize, theme: &Theme
+    ) -> Vec<Hightlight> {
+        let mut cache = self.highlights_cache.borrow_mut();
+        let key = (start, end);
+        if let Some(v) = cache.get(&key) {
+            return v.clone();
+        }
 
-       According scrolling performance test:
-       Colorization gives +5% cpu, 10 vs 15 % compared to no colors
-       idea: adding colors to cache will improve performance of colored scrolling
+        let highlights = self.code.highlight_interval(start, end, theme);
+        cache.insert(key, highlights.clone());
+        highlights
+    }
 
-       Filtering by row improves performance a bit, -2%
-    */
+    fn reset_highlight_cache(&self) {
+        self.highlights_cache.borrow_mut().clear();
+    }
+
     async fn draw(&mut self) {
         let start = time::Instant::now();
+
+        if self.height < 1 { return }
+
         let is_file_empty = self.code.file_name.is_empty();
 
         if is_file_empty {
-            queue!(stdout(), cursor::Hide);
-            if self.tree_view.is_search(){ queue!(stdout(), cursor::Show); }
+            let _ = queue!(stdout(), cursor::Hide);
+            if self.tree_view.is_search(){
+                let _ = queue!(stdout(), cursor::Show);
+            }
             self.tree_view.draw(is_file_empty);
-            // self.draw_logo();
+            self.draw_logo();
             self.draw_status();
             self.tree_view.draw_search();
             stdout().flush().expect("flush");
@@ -995,269 +964,234 @@ impl Editor {
         self.draw_cursor();
         self.tree_view.draw_search();
 
+        if !self.upd { return }
 
-        if !self.upd || self.height < 1 { return; } // it will do nothing if upd not marked
-
-
-        let mut stdout = stdout();
-        queue!(stdout, cursor::Hide).unwrap();
-
-
-        let status = self.status_line();
-
-        if self.width < self.lp_width + self.ln_width + self.lns_width + status.chars().count() { return; } // too small
-
-        let colors = self.code.colors(self.y, self.y + self.height, &self.theme);
-
-        let lines = self.code
-            .slice(self.y, self.y + self.height)
-            .lines()
-            .take(self.height);
-
-        let lines_count = lines.len();
-
-        let mut bytes_counter = self.code.line_to_byte(self.y);
-
-        let uri = format!("file://{}", self.code.abs_path.clone());
-
-        let diagnostics = self.diagnostics.clone();
-        let maybe_diagnostics = diagnostics.try_lock().unwrap();
-        let maybe_diagnostics = maybe_diagnostics.get(&uri);
-
-        let start_row = self.y.clone();
-        let end_row = start_row + self.height;
-
-        let line2error = match maybe_diagnostics {
-            Some(d) =>  {
-                d.diagnostics.iter()
-                .filter(|d| d.severity == 1) // errors only
-                .filter(|d| start_row <= d.range.start.line as usize  && d.range.start.line as usize <= end_row)
-                .map(|d| (d.range.start.line as usize, &d.message))
-                .collect::<HashMap<usize, &String>>()
-            },
-            None => HashMap::new(),
-        };
-
-
-        for (row, line) in lines.enumerate() {
-            let rrow = row + self.y;
-
-            queue!(stdout, cursor::MoveTo(self.lp_width as u16, row as u16)).unwrap();
-
-            let line_number = format!("{:width$}", rrow + 1, width = self.ln_width);
-            let lncolor = if line2error.contains_key(&rrow) { self.ecolor } else { self.lncolor };
-            queue!(stdout, BColor(Color::Reset), FColor(lncolor), Print(line_number));
-
-            let (run_or_empty, run_or_empty_color) = match self.code.is_runnable(rrow) {
-                false => (" ".repeat(self.lns_width), Color::Reset),
-                true => (format!("  {}  ", '▶'), Color::AnsiValue((87))), // todo: make it dynamic
-            };
-
-            // let (run_or_empty, run_or_empty_color) = (" ".repeat(self.lns_width), Color::Reset)
-
-            queue!(stdout, BColor(Color::Reset), FColor(run_or_empty_color), Print(run_or_empty));
-            queue!(stdout, BColor(Color::Reset), FColor(Color::Reset));
-
-
-            let filtered_colors: Vec<_> = colors.iter()
-                .filter(|(_, _, start, end, _)| *start <= rrow && rrow <= *end)
-                .collect(); // todo:: add sort by range start and renge len
-
-            let chars = line.chars();
-            let chars_len = line.chars().len();
-            let mut last_fg_color = Color::Reset;
-            let mut last_bg_color = Color::Reset;
-            let mut tabs_offset = 0;
-
-            let is_overlayed = self.overlay_lines.contains(&row);
-
-            let mut ccol = 0;
-
-            for (col, ch) in chars.enumerate() {
-                // ccol += 1;
-                let outside_left = self.x > col;
-                let outside_right = col >= self.width - self.lp_width - self.ln_width - self.lns_width  + self.x - 1 - tabs_offset;
-
-                if outside_right || ch == '\n' || outside_left || is_overlayed {
-                    bytes_counter += ch.len_utf8();
-                    continue;
-                }
-
-                let color_range = filtered_colors.iter()
-                    .find(|(start_byte, end_byte, _, _, _)| {
-                        *start_byte <= bytes_counter && bytes_counter < *end_byte
-                    });
-
-                let fg_color = match color_range {
-                    Some((_, _, _, _, color)) => *color, None => Color::Reset,
-                };
-
-                let bg_color = match self.selection.is_selected(row + self.y, col) {
-                    true => self.selcolor, false => Color::Reset,
-                };
-
-                let chr = if ch == '\t' {
-                    let tab_width = self.code.indent_width().unwrap_or(2);
-                    if self.x == 0 { tabs_offset += tab_width; " ".repeat(tab_width) }
-                    else { " ".to_string() }
-                } else { ch.to_string() };
-
-                for ch in chr.chars() {
-                    ccol += 1;
-                    // let cell = crate::screen::Cell::new(ch, fg_color, bg_color);
-                    // if self.screen_buffer.cell_equal(col, row, &cell) {
-                    //     queue!(stdout, cursor::MoveRight(1)).unwrap();
-                    //     stdout.flush();
-                    //     // nothing to do
-                    // } else {
-                    //     queue!(stdout, BColor(bg_color), FColor(fg_color), Print(ch)).unwrap();
-                    //     stdout.flush();
-                    //     self.screen_buffer.set_cell(col, row, cell);
-                    // }
-
-                    if last_fg_color == fg_color && last_bg_color == bg_color {
-                        queue!(stdout, Print(ch)).unwrap();
-                    } else {
-                        queue!(stdout, BColor(bg_color), FColor(fg_color), Print(ch)).unwrap();
-                        last_fg_color = fg_color;
-                        last_bg_color = bg_color;
-                    }
-                }
-
-                bytes_counter += ch.len_utf8();
-            }
-
-
-            if line2error.contains_key(&rrow) {
-                let error_message = &line2error.get(&rrow).unwrap();
-                self.draw_error(error_message, rrow, row)
-            };
-
-            if self.lp_width + self.ln_width + self.lns_width + ccol  < self.width - 1 {
-                for c in ccol..self.width-1 {
-                    let cell = crate::screen::Cell::new(' ', Color::Reset, Color::Reset);
-                    self.screen_buffer.set_cell(c, row, cell);
-                }
-                queue!(stdout, BColor(Color::Reset), terminal::Clear(ClearType::UntilNewLine));
-            }
-            // if row < self.height -1{
-                // queue!(
-                //     stdout, 
-                //     // cursor::MoveTo((self.lp_width + self.ln_width + self.lns_width + ccol) as u16, row as u16),
-                //     BColor(Color::Reset), 
-                //     terminal::Clear(ClearType::UntilNewLine)
-                // ).unwrap();
-                stdout.flush();
-                1;
-                // for some reason status line flickering effect
-            // }
-
-            if is_overlayed { continue; }
-
-            // if row == self.height -1 && status.chars().count() < self.width {
-            //     let x = self.lp_width + self.ln_width + self.lns_width +
-            //          chars_len + line2error.get(&rrow).map(|e|e.len() +3).unwrap_or(0);
-
-            //     let x1 = self.width -1 - status.chars().count();
-            //     for c in x..=x1+1 { // for last line filling empty space manually until statusline
-            //         queue!(stdout, BColor(Color::Reset), Print(' ')).unwrap();
-            //     }
-            // } else {
-            //     queue!(stdout, BColor(Color::Reset), terminal::Clear(ClearType::UntilNewLine)).unwrap();
-            // }
-        }
-
-
-        if lines_count < self.height && status.chars().count() < self.width {
-            // queue!(stdout, terminal::Clear(ClearType::FromCursorDown)).unwrap(); // flickering???
-            // fill empty space
-            for row in lines_count..self.height {
-                queue!(stdout, cursor::MoveTo(self.lp_width as u16, row as u16));
-                queue!(stdout, BColor(Color::Reset), terminal::Clear(ClearType::UntilNewLine)).unwrap();
-            }
-
-            queue!(stdout, cursor::MoveTo(self.lp_width as u16, self.height as u16));
-            for c in self.lp_width..self.width-status.chars().count()-1 {
-                queue!(stdout, Print(' ')).unwrap();
-            }
-        }
-
-        // debug!("screen buffer {:?}", self.screen_buffer);
-
+        self.draw_editor();
         self.draw_status();
+        // self.draw_ttr(start);
         self.draw_cursor();
 
         self.tree_view.draw_search();
 
-        stdout.flush().expect("flush");
-
-        // let elapsed = time::Instant::now() - start;
-        // let ttr = format!("{:?} ns", elapsed.as_nanos()); // time to render
-
-        // queue!(
-        //     stdout,
-        //     cursor::MoveTo((self.width - 40) as u16, (self.height) as u16),
-        //     FColor(self.lncolor),
-        //     Print(ttr),
-        // )
-        // .expect("Can not draw time to render");
-        // self.draw_cursor();
-
-        // stdout.flush().expect("flush");
-
+        stdout().flush().expect("flush");
         self.upd = false;
     }
 
-    fn draw_error(&self, error_message: &String, rrow:usize, row:usize) {
-        let space = 3;
-        let max_x = self.lp_width + self.ln_width + self.lns_width + self.code.line_len(rrow) + space;
+    fn draw_ttr(&mut self, start: time::Instant) {
+        let elapsed = time::Instant::now() - start;
+        let ttr = format!(" {:?} ms  {:?} ns",
+            elapsed.as_millis(), elapsed.as_nanos()
+        );
 
-        if max_x > self.width { return; }
+        let _ = queue!(
+            stdout(),
+            cursor::MoveTo((self.width - ttr.len() -1) as u16, (self.height) as u16),
+            FColor(self.lncolor),
+            Print(ttr),
+        );
 
-        queue!(stdout(), Print(" ".repeat(space)));
+        self.draw_cursor();
+    }
 
-        let limit = self.width - max_x;
+    fn draw_editor(&self) {
+        let mut stdout = stdout();
+        let _ = queue!(stdout, cursor::Hide);
 
-        let m: String = error_message.chars()
-            .map(|ch| if ch == '\n' { ' ' } else { ch })
-            .take(limit).collect();
+        let area = Rect::new(
+            (self.lp_width) as u16, 0 as u16,
+            self.width as u16, self.height as u16,
+        );
 
-        queue!(stdout(),
-            cursor::MoveTo(max_x as u16, row as u16),
-            BColor(Color::Reset),
-            FColor(self.ecolor), Print(m)
-        ).unwrap();
+        let total_lines = self.code.len_lines();
+        let line_number_width = self.get_line_number_width();
+
+        let _ = queue!(stdout, cursor::MoveTo(area.left(), area.top()));
+
+        let line2error = self.get_lines_errors(self.y, self.y + self.height);
+        let mut last_line_drawn = 0;
+
+        // draw line numbers and text
+        for screen_y in 0..(area.height as usize) {
+            if self.overlay_lines.contains(&screen_y) { continue }
+
+            let line_idx = self.y + screen_y;
+            last_line_drawn = screen_y;
+            if line_idx >= total_lines { break }
+
+            let draw_y = area.top() + screen_y as u16;
+            if draw_y >= area.bottom() { break }
+
+            let _ = queue!(stdout, cursor::MoveTo(area.left(), area.top() + draw_y));
+
+            if self.code.is_runnable(line_idx) {
+                self.draw_run_button(screen_y, self.lbcolor);
+            } else {
+                let _ = queue!(stdout, BColor(Color::Reset), FColor(Color::Reset), Print(" "));
+            }
+
+            let line_number = format!("{:^width$}", line_idx + 1, width = line_number_width-1);
+            let _ = queue!(stdout, BColor(Color::Reset), FColor(self.lncolor), Print(line_number));
+
+            let line_len = self.code.line_len(line_idx);
+            let max_x = (area.width as usize).saturating_sub(line_number_width).saturating_sub(area.left() as usize);;
+
+            let start_col = self.x.min(line_len);
+            let end_col = (start_col + max_x).min(line_len);
+
+            let line_start_char = self.code.line_to_char(line_idx);
+            let char_start = line_start_char + start_col;
+            let char_end = line_start_char + end_col;
+
+            let visible_chars = self.code.char_slice(char_start, char_end);
+            let displayed_line = visible_chars.to_string().replace("\t", &" ");
+
+            let start_byte = self.code.char_to_byte(char_start);
+            let end_byte = self.code.char_to_byte(char_end);
+
+            let highlights = self.cached_highlight_interval(start_byte, end_byte, &self.theme);
+
+            let mut x = 0;
+            let mut byte_idx_in_rope = start_byte;
+
+            for ch in displayed_line.chars().take(max_x) {
+                if x >= area.width as usize { break }
+
+                let ch_width = 1;
+                let ch_len = ch.len_utf8();
+
+                let mut fcolor = Color::Reset;
+                for &(start, end, s) in &highlights {
+                    if start <= byte_idx_in_rope && byte_idx_in_rope < end {
+                        fcolor = s;
+                        break;
+                    }
+                }
+
+                let bcolor = match self.selection.is_selected(line_idx, x) {
+                    true => self.selcolor,
+                    false => Color::Reset,
+                };
+
+                let _ = queue!(stdout, FColor(fcolor), BColor(bcolor), Print(ch));
+
+                x += ch_width;
+                byte_idx_in_rope += ch_len;
+            }
+
+            if let Some(errors) = line2error.get(&line_idx) {
+                let x_error = area.left() as usize + line_number_width + end_col;
+                self.draw_error(errors, x_error, screen_y);
+            }
+
+            let _ = queue!(stdout, BColor(Color::Reset), terminal::Clear(ClearType::UntilNewLine));
+        }
+
+        if last_line_drawn < self.height {
+            // fill empty space
+            for row in last_line_drawn+1..self.height {
+                if self.overlay_lines.contains(&row) { continue }
+                let _ = queue!(stdout, cursor::MoveTo(area.left(), row as u16));
+                let _ = queue!(stdout, BColor(Color::Reset), terminal::Clear(ClearType::UntilNewLine));
+            }
+        }
+
+    }
+
+    fn get_lines_errors(
+        &self,
+        start_row: usize,
+        end_row: usize,
+    ) -> HashMap<usize, Vec<Diagnostic>> {
+        let uri = format!("file://{}", self.code.abs_path);
+        let diagnostics = self.diagnostics.clone();
+        let maybe_diagnostics = diagnostics.try_lock().unwrap();
+        let maybe_diagnostics = maybe_diagnostics.get(&uri);
+
+        match maybe_diagnostics {
+            Some(d) => {
+                let mut errors = HashMap::new();
+
+                for diag in d.diagnostics.iter() {
+                    let line = diag.range.start.line as usize;
+                    if start_row <= line && line <= end_row {
+                        errors
+                            .entry(line)
+                            .or_insert_with(Vec::new)
+                            .push(diag.clone());
+                    }
+                }
+
+                errors
+            }
+            None => HashMap::new(),
+        }
+    }
+
+    fn draw_error(&self, error_messages: &[Diagnostic], x: usize, y: usize) {
+        let space = 5;
+        let prefix = " ".repeat(space);
+
+        for (i, msg) in error_messages.iter().enumerate() {
+            let draw_y = y + i;
+            if x >= self.width || draw_y >= self.height {
+                break;
+            }
+
+            let available_width = self.width.saturating_sub(x);
+            let message_limit = available_width.saturating_sub(space);
+
+            let m: String = msg.message
+                .replace('\n', " ")
+                .chars()
+                .take(message_limit)
+                .collect();
+
+            let full_msg = format!("{prefix}{m}");
+
+            let color = match msg.severity {
+                1 => Color::Red,
+                _ => Color::Blue,
+            };
+
+            let _ = queue!(
+                stdout(),
+                cursor::MoveTo(x as u16, draw_y as u16),
+                BColor(Color::Reset),
+                FColor(color),
+                Print(full_msg),
+                FColor(Color::Reset)
+            );
+        }
     }
 
     fn draw_cursor(&mut self) {
-        if !self.cursor_is_focused() { return; }
         if self.code.file_name.is_empty() { return; }
 
-        let out_left = self.c < self.x;
-        let out_right = self.lp_width + self.ln_width + self.lns_width + self.c - self.x >= self.width;
-        if out_left || out_right {
-            queue!(stdout(), cursor::Hide).expect("Can not hide cursor");
+        let line_number_digits = self.get_line_number_width();
+        let vertical_fit = (self.r >= self.y) && (self.r - self.y) < self.height;
+        let horizontal_fit = (self.c >= self.x)
+            && (self.lp_width + line_number_digits + self.c - self.x) < self.width;
+
+        if !vertical_fit || !horizontal_fit {
             return;
         }
 
-        let cursor_x_pos = if self.x != 0 { // if horizontal scroll, ignore indentation
-            self.c + self.lp_width + self.ln_width + self.lns_width - self.x
-        } else {
-            let tabs_count = self.code.count_tabs(self.r, self.c).unwrap_or(0);
-            let ident_width = self.code.indent_width().unwrap_or(2);
-            let tabs_correction = tabs_count * (ident_width-1);
-            self.c + self.lp_width + self.ln_width + self.lns_width - self.x + tabs_correction
-        };
+        let out_left = self.c < self.x;
+        let out_right = self.lp_width + line_number_digits + self.c - self.x >= self.width;
+        if out_left || out_right {
+            let _ = queue!(stdout(), cursor::Hide);
+            return;
+        }
 
+        let cursor_x_pos = self.c + self.lp_width + line_number_digits - self.x;
         let cursor_y_pos = self.r - self.y;
 
-        queue!(
+        let _ = queue!(
             stdout(),
             cursor::MoveTo(cursor_x_pos as u16, cursor_y_pos as u16),
             FColor(Color::Reset),
             cursor::Show
-        )
-        .expect("Can not show cursor");
+        );
 
         stdout().flush().expect("flush");
     }
@@ -1267,16 +1201,23 @@ impl Editor {
         let x = self.width - status.chars().count();
         let y = self.height - 1;
 
-        queue!(
+        let _ = queue!(
             stdout(),
             cursor::Hide,
             cursor::MoveTo(x as u16, y as u16),
             FColor(self.scolor),
             Print(status)
-        )
-        .expect("Can not print status");
+        );
+    }
 
-        stdout().flush().expect("flush");
+    fn draw_run_button(&self, row: usize, color: Color) {
+        let run = "▶";
+        let _ = queue!(stdout(),
+            cursor::Hide, cursor::MoveTo(self.lp_width as u16, row as u16),
+            BColor(Color::Reset), FColor(color),
+            Print(run),
+            BColor(Color::Reset), FColor(Color::Reset)
+        );
     }
 
     fn draw_logo(&mut self) {
@@ -1292,79 +1233,35 @@ impl Editor {
         let mut stdout = stdout();
 
         for r in 0..self.height{
-            queue!(stdout,
+            let _ = queue!(stdout,
                 cursor::MoveTo(self.lp_width as u16, r as u16),
                 terminal::Clear(ClearType::UntilNewLine)
             );
         }
 
         for (i,line) in lines.iter().enumerate() {
-            queue!(stdout,
+            let _ = queue!(stdout,
                 cursor::MoveTo((fromx) as u16, (fromy + i) as u16),
                 FColor(Color::Reset), Print(line)
             ).unwrap();
         }
     }
 
-    fn find_cursor_x_position(&self, mx: usize) -> usize {
-        let mut count = 0;
-        let mut real_count = 0; // searching x position
-
-        let line = self.code.get_line_at(self.r);
-        if line.is_none() { return 0; }
-        let line = line.unwrap();
-
-        for ch in line.chars() {
-            if count >= mx + self.x { break; }
-            if ch == '\t' && self.x == 0 {
-                count += self.code.indent_width().unwrap_or(2);
-                real_count += 1;
-            } else {
-                count += 1;
-                real_count += 1;
-            }
-        }
-
-        real_count
-    }
-
-
-    fn cursor_is_focused(&mut self) -> bool {
-        (self.r >= self.y) && (self.r - self.y) < self.height
-    }
-    fn cursor_is_invisible_at_bottom(&mut self) -> bool {
-        self.r >= self.y && !self.cursor_is_focused()
-    }
-    fn cursor_is_invisible_at_top(&mut self) -> bool {
-        self.y >= self.r && !self.cursor_is_focused()
-    }
-    fn cursor_is_invisible_at_left(&mut self) -> bool {
-        self.c < self.x
-    }
-    fn cursor_is_invisible_at_right(&mut self) -> bool {
-        self.lp_width + self.ln_width + self.lns_width + self.c - self.x >= self.width
-    }
-
-    fn focus_to_down(&mut self) {
-        self.y = self.r - self.height + 1
-    }
-    fn focus_to_up(&mut self) {
-        self.y = self.r
-    }
-    fn focus_to_right(&mut self) {
-        self.x = self.c - self.width + 1 + self.ln_width + self.lns_width + self.lp_width;
-    }
-    fn focus_to_left(&mut self) {
-        self.x = self.c;
-    }
     fn focus_to_center(&mut self) {
         if self.r > self.height / 2 {
             self.y = self.r - (self.height / 2)
         }
     }
+
     fn fit_cursor(&mut self) {
-        if self.c > self.code.line_len(self.r) {
-            self.c = self.code.line_len(self.r)
+        let len_lines = self.code.len_lines();
+        if self.r >= len_lines {
+            self.r = len_lines - 1;
+        }
+
+        let line_len = self.code.line_len(self.r);
+        if self.c > line_len {
+            self.c = line_len;
         }
     }
 
@@ -1372,7 +1269,7 @@ impl Editor {
         if self.r > 0 {
             self.r -= 1;
             self.fit_cursor();
-            self.handle_movement();
+            self.focus();
         }
     }
 
@@ -1380,7 +1277,7 @@ impl Editor {
         if self.r < self.code.len_lines() - 1 {
             self.r += 1;
             self.fit_cursor();
-            self.handle_movement();
+            self.focus();
         }
     }
 
@@ -1400,6 +1297,7 @@ impl Editor {
             };
             self.fit_cursor();
             self.upd = true;
+            self.focus();
         }
     }
 
@@ -1409,7 +1307,7 @@ impl Editor {
         } else {
             0
         };
-        
+
         if self.y < max_y {
             // Move view down by a page
             self.y = if self.y + self.height < max_y {
@@ -1425,45 +1323,51 @@ impl Editor {
             };
             self.fit_cursor();
             self.upd = true;
+            self.focus();
         }
     }
 
     fn handle_left(&mut self) {
         if self.c > 0 {
             self.c -= 1;
-            if self.x > 0 && self.cursor_is_invisible_at_left() {
-                self.focus_to_left();
-                self.upd = true
-            }
-            if self.cursor_is_invisible_at_right() {
-                self.focus_to_right();
-                self.upd = true
-            }
         } else if self.r > 0 {
             self.r -= 1;
             self.c = self.code.line_len(self.r);
         }
 
-        self.handle_movement();
+        self.upd = true;
+        self.focus();
     }
 
     fn handle_right(&mut self) {
         if self.c < self.code.line_len(self.r) {
             self.c += 1;
-            if self.x > 0 && self.cursor_is_invisible_at_left() {
-                self.focus_to_left();
-                self.upd = true
-            }
-            if self.cursor_is_invisible_at_right() {
-                self.focus_to_right();
-                self.upd = true
-            }
         } else if self.r < self.code.len_lines() - 1 {
             self.r += 1;
             self.c = 0;
         }
+        self.upd = true;
+        self.focus();
+    }
 
-        self.handle_movement();
+    fn handle_right_word(&mut self) {
+        let line = self.code.line_at(self.r);
+        if line.is_none() { return; }
+        let line = line.unwrap();
+        let next = utils::find_next_word(line, self.c+1);
+        self.c = next;
+        self.upd = true;
+        self.focus();
+    }
+
+    fn handle_left_word(&mut self) {
+        let line = self.code.line_at(self.r);
+        if line.is_none() { return; }
+        let line = line.unwrap();
+        let next = utils::find_prev_word(line, self.c-1);
+        self.c = next;
+        self.upd = true;
+        self.focus();
     }
 
     async fn handle_enter(&mut self) {
@@ -1487,13 +1391,13 @@ impl Editor {
                     ).await;
                 }
 
-                self.clean_diagnostics();
-
                 self.c = indentation.chars().count();
             },
             None => {},
         }
-        self.handle_movement();
+        self.focus();
+        self.clean_diagnostics();
+        self.reset_highlight_cache();
     }
 
     async fn handle_delete(&mut self) {
@@ -1508,7 +1412,7 @@ impl Editor {
             && self.code.indentation_level(self.r) > 0 {
             // remove indentations only
 
-            let remove_all_indents = true;
+            let remove_all_indents = false;
 
             let il = self.code.indentation_level(self.r);
             let mut indent_from = match self.code.indent_unit() { // vscode like removal
@@ -1534,6 +1438,7 @@ impl Editor {
             self.c = indent_from;
             self.upd = true;
             self.clean_diagnostics();
+            self.reset_highlight_cache();
 
             if remove_all_indents == false { return }
         }
@@ -1543,13 +1448,16 @@ impl Editor {
             self.code.remove_char(self.r, self.c);
 
             if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
-                lsp.lock().await.did_change(self.r, self.c-1, self.r, self.c, &self.code.abs_path, "").await;
+                lsp.lock().await.did_change(
+                    self.r, self.c - 1, self.r,
+                    self.c, &self.code.abs_path, ""
+                ).await;
             }
 
             self.c -= 1;
             self.upd = true;
             self.clean_diagnostics();
-
+            self.reset_highlight_cache();
         } else if self.r != 0 {
             // remove enter char
             let prev_line_len = self.code.line_len(self.r - 1);
@@ -1557,61 +1465,86 @@ impl Editor {
             self.code.remove_text(self.r - 1, prev_line_len, self.r, self.c);
 
             if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
-                lsp.lock().await.did_change(self.r - 1, prev_line_len, self.r, self.c, &self.code.abs_path, "").await;
+                lsp.lock().await.did_change(
+                    self.r - 1, prev_line_len,
+                    self.r, self.c, &self.code.abs_path, ""
+                ).await;
             }
 
             self.r -= 1;
             self.c = prev_line_len;
             self.upd = true;
-
             self.clean_diagnostics();
+            self.reset_highlight_cache();
         }
 
-        self.handle_movement();
+        self.focus();
     }
 
-    fn copy_to_clipboard(&mut self) {
-        if self.selection.empty() { return; }
+    fn copy_to_clipboard(&mut self, maybe_text: Option<String>) {
 
-        let (y, x) = self.selection.from();
-        let (yto, xto) = self.selection.to();
-        let text = self.code.get_text(y, x, yto, xto);
+        let text = match maybe_text {
+            Some(text) => text,
+            None => {
+                if self.selection.empty() { return; }
+                let (y, x) = self.selection.from();
+                let (yto, xto) = self.selection.to();
+                let text = self.code.get_text(y, x, yto, xto);
+                text
+            },
+        };
 
-        let mut ctx = ClipboardContext::new().unwrap();
-        ctx.set_contents(text).unwrap();
-        // let mut clipboard = arboard::Clipboard::new().unwrap();
-        // clipboard.set_text(text).unwrap();
+        let result = arboard::Clipboard::new()
+            .and_then(|mut c| c.set_text(text.to_string()));
+
+        if result.is_err() {
+            self.clipboard = Some(text.to_string());
+        }
+    }
+
+    fn get_clipboard(& self) -> anyhow::Result<String> {
+        let maybe_text = arboard::Clipboard::new()
+            .and_then(|mut c| c.get_text())
+            .ok()
+            .or_else(|| self.clipboard.clone());
+
+        match maybe_text {
+            Some(text) => Ok(text),
+            None => Err(anyhow!("cant get clipboard")),
+        }
     }
 
     async fn paste_from_clipboard(&mut self) {
+        let text = match self.get_clipboard() {
+            Ok(text) => text,
+            Err(_) => return,
+        };
+
         if self.selection.non_empty_and_active() {
             self.handle_cut().await;
         }
 
-        let mut ctx = ClipboardContext::new().unwrap();
-        let text = ctx.get_contents().unwrap();
         self.code.insert_text(&text, self.r, self.c);
 
         let path = &self.code.abs_path;
         let lang = &self.code.lang;
 
         if let Some(lsp) = self.lang2lsp.get(lang) {
-            lsp.lock().await.did_change(self.r, self.c, self.r, self.c, &path, &text).await;
+            lsp.lock().await.did_change(
+                self.r, self.c, self.r,
+                self.c, &path, &text
+            ).await;
         }
 
-        self.clean_diagnostics();
-
-        for ch in text.chars() {
-            match ch {
-                '\n' => {
-                    self.r += 1;
-                    self.c = 0;
-                }
-                _ => self.c += 1,
-            }
-        }
+        for ch in text.chars() { match ch {
+            '\n' => { self.r += 1; self.c = 0; }
+            _ => self.c += 1,
+        }}
 
         self.upd = true;
+        self.focus();
+        self.clean_diagnostics();
+        self.reset_highlight_cache();
     }
 
     fn selected_text(&mut self) -> String {
@@ -1630,20 +1563,22 @@ impl Editor {
             let lang = &self.code.lang;
 
             if let Some(lsp) = self.lang2lsp.get(lang) {
-                lsp.lock().await.did_change(self.r, self.c, self.r, self.c, &path, &text).await;
+                lsp.lock().await.did_change(
+                    self.r, self.c, self.r, self.c, &path, &text
+                ).await;
             }
 
-            for ch in text.chars() {
-                match ch { // calculate cursor position
-                    '\n' => { self.r += 1; self.c = 0; }
-                    _ => self.c += 1,
-                }
-            }
+            for ch in text.chars() { match ch {
+                '\n' => { self.r += 1; self.c = 0; }
+                _ => self.c += 1,
+            }}
 
             self.selection.clean();
             self.selection.keep_once = false;
             self.upd = true;
+            self.focus();
             self.clean_diagnostics();
+            self.reset_highlight_cache();
 
         } else if self.r < self.code.len_lines() - 1 {
             let text = self.code.get_text(self.r, 0, self.r + 1, 0);
@@ -1655,13 +1590,17 @@ impl Editor {
 
             if let Some(lsp) = self.lang2lsp.get(lang) {
                 let change_text = format!("\n{}", &text);
-                lsp.lock().await
-                    .did_change(self.r-1, text.len(), self.r-1, text.len(), path, &change_text)
-                    .await;
+                lsp.lock().await.did_change(
+                    self.r-1, text.len(),
+                    self.r-1, text.len(),
+                    path, &change_text
+                ).await;
             }
 
             self.upd = true;
+            self.focus();
             self.clean_diagnostics();
+            self.reset_highlight_cache();
         }
     }
 
@@ -1685,6 +1624,7 @@ impl Editor {
         self.selection.keep_once = false;
         self.upd = true;
         self.clean_diagnostics();
+        self.reset_highlight_cache();
     }
 
     async fn handle_cut_line(&mut self) {
@@ -1705,25 +1645,7 @@ impl Editor {
         self.selection.keep_once = false;
         self.upd = true;
         self.clean_diagnostics();
-    }
-
-    fn handle_movement(&mut self) {
-        if self.cursor_is_focused() {
-            // optimization
-            self.draw_status(); // no need full update
-            self.draw_cursor();
-            return;
-        }
-        if self.cursor_is_invisible_at_bottom() {
-            self.upd = true; // needs full update
-            self.focus_to_down();
-            return;
-        }
-        if self.cursor_is_invisible_at_top() {
-            self.upd = true; // needs full update
-            self.focus_to_up();
-            return;
-        }
+        self.reset_highlight_cache();
     }
 
     fn scroll_down(&mut self) {
@@ -1733,12 +1655,48 @@ impl Editor {
         self.y += 1;
         self.upd = true;
     }
+
     fn scroll_up(&mut self) {
         if self.y == 0 {
             return;
         }
         self.y -= 1;
         self.upd = true;
+    }
+
+    fn focus(&mut self) {
+        let area = Rect::new(
+            (self.lp_width) as u16, 0 as u16,
+            self.width as u16, self.height as u16,
+        );
+
+        let width = area.width as usize;
+        let height = area.height as usize;
+        let total_lines = self.code.len_lines();
+        let max_line_number = total_lines.max(1);
+        let line_number_digits = max_line_number.to_string().len().max(5);
+
+        let line = self.r;
+        let col = self.c;
+
+        let visible_width = width.saturating_sub(line_number_digits);
+        let visible_height = height;
+
+        if col < self.x {
+            self.x = col;
+            self.upd = true;
+        } else if col >= self.x + visible_width {
+            self.x = col.saturating_sub(visible_width - 1);
+            self.upd = true;
+        }
+
+        if line < self.y {
+            self.y = line;
+            self.upd = true;
+        } else if line >= self.y + visible_height {
+            self.y = line.saturating_sub(visible_height - 1);
+            self.upd = true;
+        }
     }
 
     async fn insert_char(&mut self, c: char) {
@@ -1754,8 +1712,11 @@ impl Editor {
         }
 
         self.c += 1;
+
         self.upd = true;
+        self.focus();
         self.clean_diagnostics();
+        self.reset_highlight_cache();
     }
 
     async fn insert_tab(&mut self) {
@@ -1768,7 +1729,9 @@ impl Editor {
             lsp.lock().await.did_change(r,c, r,c, &self.code.abs_path, &inserted).await;
         }
         self.upd = true;
+        self.focus();
         self.clean_diagnostics();
+        self.reset_highlight_cache();
     }
 
     async fn comment_line(&mut self) {
@@ -1812,7 +1775,10 @@ impl Editor {
         }
 
         self.upd = true;
+        self.focus();
         self.handle_down();
+        self.clean_diagnostics();
+        self.reset_highlight_cache();
     }
 
     fn save(&mut self) {
@@ -1873,6 +1839,9 @@ impl Editor {
             None => {},
         }
         self.upd = true;
+        self.focus();
+        self.clean_diagnostics();
+        self.reset_highlight_cache();
     }
 
     async fn redo(&mut self) {
@@ -1926,10 +1895,49 @@ impl Editor {
             None => {},
         }
         self.upd = true;
+        self.focus();
         self.clean_diagnostics();
+        self.reset_highlight_cache();
     }
 
-    async fn local_search(&mut self) {
+    fn update_search_results(&mut self) {
+        if self.search.pattern.len_chars() > 0 {
+            let search_results = self.code.search(
+                &self.search.pattern.to_string()
+            );
+
+            self.search.results = search_results
+                .iter()
+                .map(|(line, column)| SearchResult {
+                    line: *line,
+                    column: *column,
+                    preview: None,
+                })
+                .collect();
+
+            let closest_to_cursor = self.search.results
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, result)| {
+                    let dy = result.line.abs_diff(self.r);
+                    let dx = result.column.abs_diff(self.c);
+                    dy * 1000 + dx
+                })
+                .map(|(i, _)| i);
+
+            self.search.index = closest_to_cursor.unwrap_or(0);
+
+        } else {
+            self.search.results.clear();
+            self.search.index = 0;
+        }
+    }
+
+    pub async fn handle_local_search(&mut self) {
+        let saved_r = self.r.clone();
+        let saved_c = self.c.clone();
+        let saved_selection = self.selection.clone();
+
         let mut end = false;
         let mut changed = false;
 
@@ -1940,170 +1948,208 @@ impl Editor {
             let (yto, xto) = self.selection.to();
             let selected_text = self.code.get_text(y, x, yto, xto);
             self.search.pattern = ropey::Rope::from_str(&selected_text);
+            self.search.cursor_pos = self.search.pattern.len_chars();
+            self.update_search_results();
             changed = true;
-        }
-        if self.search.pattern.len_chars() > 0 {
-            let search_results = self.code.search(&self.search.pattern.to_string());
-            let search_results: Vec<SearchResult> = search_results.iter()
-                .map(|(line, position)| SearchResult{ line:*line, position:*position })
-                .collect();
-            self.search.results = search_results;
-            self.search.index = 0;
+        } else if self.search.pattern.len_chars() > 0 {
+            self.search.cursor_pos = self.search.pattern.len_chars();
+            self.update_search_results();
             changed = true;
         }
 
-        let mut x = self.search.pattern.len_chars();
+        let mut reader = EventStream::new();
 
         while !end {
+            self.draw_search_line(self.search.cursor_pos, self.height - 1);
 
-            self.draw_search_line(x, self.height-1);
-
-            if changed && self.search.pattern.len_chars() > 0 &&
-                !self.search.results.is_empty() {
-
+            if changed && self.search.pattern.len_chars() > 0 && !self.search.results.is_empty() {
                 let search_result = &self.search.results[self.search.index];
                 let sy = search_result.line;
-                let sx = search_result.position;
+                let sx = search_result.column;
                 self.r = sy;
                 self.c = sx + self.search.pattern.chars().count();
-                self.handle_movement();
-                if self.r - self.y == self.height-1 { self.y += 1; }  // if last line, scroll down
+                self.focus();
+                if self.r - self.y == self.height - 1 {
+                    self.y += 1;
+                }
                 self.selection.active = true;
                 self.selection.set_start(sy, sx);
                 self.selection.set_end(sy, sx + self.search.pattern.chars().count());
-
                 self.upd = true;
                 self.draw().await;
-                self.draw_search_line(x, self.height-1);
-
+                self.draw_search_line(self.search.cursor_pos, self.height - 1);
                 changed = false;
             }
 
-            let mut reader = EventStream::new();
+            if changed && self.search.pattern.len_chars() > 0 && self.search.results.is_empty() {
+                self.selection.active = false;
+                self.upd = true;
+                self.draw().await;
+                self.draw_search_line(self.search.cursor_pos, self.height - 1);
+                changed = false;
+            }
+
             let mut event = reader.next().fuse();
 
             select! {
                 maybe_event = event => {
                     match maybe_event {
                         Some(Ok(event)) => {
-                            changed = false;
-
                             match event {
-                                Event::Key(event) => {
-                                    match (event.modifiers, event.code) {
-                                        (KeyModifiers::CONTROL, KeyCode::Char('g')) => {
-                                            self.global_search().await;
-                                            self.overlay_lines.clear();
-                                            return;
-                                        }
-                                        _ => {}
+                                Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
+                                    self.r = saved_r; self.c = saved_c;
+                                    self.selection = saved_selection.clone();
+                                    self.upd = true;
+                                    if self.code.file_name.is_empty() {
+                                        let _ = queue!(stdout(), terminal::Clear(ClearType::All));
+                                        stdout().flush().ok();
                                     }
-
-                                    match event.code {
-                                        KeyCode::Up => {
-                                            if self.search.index > 0 {
-                                                self.search.index -= 1;
-                                            } else {
-                                                self.search.index = self.search.results.len() - 1
-                                            }
-                                            changed = true;
-                                        },
-                                        KeyCode::Down => {
-                                            self.search.index += 1;
-                                            if self.search.index >= self.search.results.len() {
-                                                self.search.index = 0;
-                                            }
-                                            changed = true;
-                                        },
-                                        KeyCode::Left if x > 0 => x -= 1,
-                                        KeyCode::Right if x < self.search.pattern.len_chars() => x += 1,
-                                        KeyCode::Enter => { 
-                                            if self.code.file_name.is_empty() {
-                                                self.global_search().await;
-                                                self.overlay_lines.clear();
-                                                self.upd = true;
-                                                if self.code.file_name.is_empty() {
-                                                    queue!(stdout(), terminal::Clear(ClearType::All));
-                                                    stdout().flush();
-                                                }
-                                            }   
-                                            end = true;
-                                        },
-                                        KeyCode::Esc => { 
-                                            end = true; 
-                                        },
-                                        KeyCode::Backspace if x > 0 => {
-                                            x -= 1;
-                                            self.clean_search_line();
-                                            self.search.pattern.remove(x..x+1);
-
-                                            if self.search.pattern.len_chars() > 0 {
-
-                                                let search_results = self.code.search(&self.search.pattern.to_string());
-                                                let search_results: Vec<SearchResult> = search_results.iter()
-                                                    .map(|(line, position)| SearchResult{ line:*line, position:*position })
-                                                    .collect();
-
-                                                self.search.results = search_results;
-                                                self.search.index = 0;
-                                                changed = true;
-                                            }
-                                        },
-                                        KeyCode::Char(c) => {
-                                            self.clean_search_line();
-                                            self.search.pattern.insert_char(x, c);
-                                            x += 1;
-                                            let search_results = self.code.search(&self.search.pattern.to_string());
-                                            let search_results: Vec<SearchResult> = search_results.iter()
-                                                .map(|(line, position)| SearchResult{ line:*line, position:*position })
-                                                .collect();
-
-                                            self.search.results = search_results;
-                                            self.search.index = 0;
-                                            changed = true;
-                                            // debug!("search_results {:?}", search_results);
-                                        },
-                                        _ => {
-                                            debug!("event.code {:?}", event.code);
-                                        }
-                                    }
+                                    end = true;
                                 }
-                                _ => {}
+                                _ => {
+                                    end = self.handle_search_event(event).await;
+                                    changed = true;
+                                }
                             }
-
                         }
-
                         Some(Err(e)) => {
-                            debug!("Error: {:?}\r", e);
+                            debug!("Error reading event: {:?}", e);
                             end = true;
-                        },
-                        None => { end = true; },
+                        }
+                        None => {
+                            end = true;
+                        }
                     }
                 }
-            };
+            }
         }
+
         self.upd = true;
         self.search.active = false;
     }
+
+    async fn handle_search_event(&mut self, event: Event) -> bool {
+        // Returns true if the search should end
+        match event {
+            Event::Resize(w, h) => {
+                self.upd = true;
+                self.tree_view.upd = true;
+                self.resize(w as usize, h as usize);
+                self.draw().await;
+                false
+            }
+            Event::Key(key_event) => {
+
+                if key_event.modifiers == KeyModifiers::CONTROL
+                    && key_event.code == KeyCode::Char('v') {
+                        if let Ok(pasted_text) = self.get_clipboard() {
+                            self.clean_search_line();
+                            for ch in pasted_text.chars() {
+                                self.search.pattern.insert_char(self.search.cursor_pos, ch);
+                                self.search.cursor_pos += 1;
+                            }
+                            self.update_search_results();
+                        }
+                    return false;
+                }
+
+                if key_event.modifiers == KeyModifiers::CONTROL
+                    && key_event.code == KeyCode::Char('g') {
+                    self.hanle_global_search().await;
+                    self.overlay_lines.clear();
+                    return true;
+                }
+
+                match key_event.code {
+                    KeyCode::Up => {
+                        if self.search.index > 0 {
+                            self.search.index -= 1;
+                        } else if !self.search.results.is_empty() {
+                            self.search.index = self.search.results.len() - 1;
+                        }
+                        self.upd = true;
+                        false
+                    }
+                    KeyCode::Down => {
+                        self.search.index += 1;
+                        if self.search.index >= self.search.results.len() {
+                            self.search.index = 0;
+                        }
+                        self.upd = true;
+                        false
+                    }
+                    KeyCode::Left => {
+                        if self.search.cursor_pos > 0 {
+                            self.search.cursor_pos -= 1;
+                        }
+                        false
+                    }
+                    KeyCode::Right => {
+                        if self.search.cursor_pos < self.search.pattern.len_chars() {
+                            self.search.cursor_pos += 1;
+                        }
+                        false
+                    }
+                    KeyCode::Enter => {
+                        if self.code.file_name.is_empty() {
+                            self.hanle_global_search().await;
+                            self.overlay_lines.clear();
+                            self.upd = true;
+                            if self.code.file_name.is_empty() {
+                                let _ = queue!(stdout(), terminal::Clear(ClearType::All));
+                                stdout().flush().ok();
+                            }
+                        }
+                        true
+                    }
+                    KeyCode::Esc => true,
+                    KeyCode::Backspace => {
+                        if self.search.cursor_pos > 0 {
+                            self.search.cursor_pos -= 1;
+                            self.clean_search_line();
+                            self.search.pattern.remove(self.search.cursor_pos..self.search.cursor_pos + 1);
+                            self.update_search_results();
+                        }
+                        false
+                    }
+                    KeyCode::Char(c) => {
+                        self.clean_search_line();
+                        self.search.pattern.insert_char(self.search.cursor_pos, c);
+                        self.search.cursor_pos += 1;
+                        self.update_search_results();
+                        false
+                    }
+                    _ => {
+                        debug!("Unhandled key code: {:?}", key_event.code);
+                        false
+                    }
+                }
+            }
+            _ => false,
+        }
+    }
+
     pub fn draw_search_line(&mut self, x:usize, y:usize) {
         let prefix = "search: ";
+        let space = " ".repeat(10);
         let line = if !self.search.results.is_empty() && self.search.pattern.len_chars() > 0 {
             let postfix = format!("{}/{}", self.search.index+1, self.search.results.len());
-            format!("{}{} {}", prefix, &self.search.pattern, postfix)
+            format!("{}{} {}{}", prefix, &self.search.pattern, postfix, space)
         } else {
-            format!("{}{} ", prefix, &self.search.pattern)
+            format!("{}{} {}", prefix, &self.search.pattern, space)
         };
 
-        queue!(stdout(),
-            cursor::MoveTo((self.lp_width + 1) as u16, (self.height-1) as u16),
+        let _ = queue!(stdout(),
+            cursor::MoveTo((self.lp_width) as u16, (self.height-1) as u16),
             BColor(Color::Reset), FColor(Color::Reset), Print(line),
         );
-        queue!(stdout(),
-            cursor::MoveTo((self.lp_width + 1 + prefix.len() + x) as u16, y as u16),
+        let _ = queue!(stdout(),
+            cursor::MoveTo((self.lp_width + prefix.len() + x) as u16, y as u16),
         );
 
         stdout().flush();
     }
+
     pub fn clean_search_line(&mut self) {
         let prefix = "search: ";
         let line = if !self.search.results.is_empty() && self.search.pattern.len_chars() > 0 {
@@ -2113,7 +2159,7 @@ impl Editor {
             format!("{}{}", prefix, &self.search.pattern)
         };
 
-        queue!(stdout(),
+        let _ = queue!(stdout(),
             cursor::MoveTo((self.lp_width + 1) as u16, (self.height-1) as u16),
             BColor(Color::Reset), FColor(Color::Reset), Print(" ".repeat(line.chars().count())),
         );
@@ -2163,7 +2209,7 @@ impl Editor {
             lsp.did_open(&lang, &abs_file, &file_content, false);
         });
     }
-    
+
     pub async fn lsp_update(&mut self) {
         let lang = self.code.lang.clone();
         let lsp = self.lang2lsp.get(&lang);
@@ -2188,42 +2234,7 @@ impl Editor {
         *lsp_status = status.to_string();
     }
 
-
-    fn score_matches(src: &str, match_str: &str) -> i32 {
-        let mut score = 0;
-
-        // If the match is at the beginning, we give it a high score.
-        if src.starts_with(match_str) {
-            score += 1000;
-        }
-
-        // Each occurrence of match_str in src adds a smaller score.
-        score += (src.matches(match_str).count() as i32) * 10;
-
-        // If match is close to the start of the string but not at the beginning, add some score.
-        if let Some(initial_index) = src.find(match_str) {
-            if initial_index > 0 && initial_index < 5 {
-                score += 500;
-            }
-        }
-
-        score
-    }
-
-    fn sort_completion_items(&self, items: &mut Vec<CompletionItem>, prev_word: &str) {
-        items.sort_by(|a, b| {
-            let sa = Self::score_matches(&a.label, prev_word);
-            let sb = Self::score_matches(&b.label, prev_word);
-            let r = sb.cmp(&sa);
-            if r == Ordering::Equal {
-                a.label.len().cmp(&b.label.len())
-            } else {
-                r
-            }
-        });
-    }
-    
-    pub async fn lsp_completion(&mut self) {
+    pub async fn completion(&mut self) {
         let mut end = false;
 
         while !end {
@@ -2246,7 +2257,7 @@ impl Editor {
             self.set_lsp_status("lsp completion").await;
 
             let (mut selected, mut selected_offset) = (0, 0);
-            let (height, mut width) = (5, 30);
+            let height = 5;
 
             let line = match self.code.line_at(self.r) {
                 Some(line) => line, None => return,
@@ -2255,23 +2266,26 @@ impl Editor {
             let prev = utils::find_prev_word(line, self.c);
             let prev_word = line.chars().skip(prev).take(self.c - prev).collect::<String>();
 
-            // Sort completion items
-            self.sort_completion_items(&mut completion_result.items, &prev_word);
+            // Sort completion items by matches score
+            completion_result.items.sort_by(|a, b| {
+                let sa = score_matches(&a.label, &prev_word);
+                let sb = score_matches(&b.label, &prev_word);
+                let r = sb.cmp(&sa);
+                if r == Ordering::Equal {
+                    a.label.len().cmp(&b.label.len())
+                } else { r }
+            });
 
-            let mut options = &completion_result.items;
+            let options = &completion_result.items;
 
             while !changed {
-
-                let mut reader = EventStream::new();
-
-
                 // calculate scrolling offsets
                 if selected < selected_offset { selected_offset = selected }
                 if selected >= selected_offset + height { selected_offset = selected - height + 1 }
 
-                self.lsp_completion_draw(height, width, options, selected, selected_offset);
-                self.upd_next = true;
+                self.draw_completion(height, options, selected, selected_offset);
 
+                let mut reader = EventStream::new();
                 let mut event = reader.next().fuse();
 
                 select! {
@@ -2279,18 +2293,24 @@ impl Editor {
                         changed = false;
                         match maybe_event {
                             Some(Ok(event)) => {
-                                if event == Event::Key(KeyCode::Esc.into()) { self.upd = true; return ;}
-                                if event == Event::Key(KeyCode::Down.into()) && selected < options.len() - 1 { selected += 1;}
-                                if event == Event::Key(KeyCode::Up.into()) && selected > 0 { selected -= 1; }
+                                if event == Event::Key(KeyCode::Esc.into()) {
+                                    self.upd = true;
+                                    return;
+                                }
+                                if event == Event::Key(KeyCode::Down.into())
+                                    && selected < options.len() - 1 {
+                                    selected += 1;
+                                }
+                                if event == Event::Key(KeyCode::Up.into())
+                                    && selected > 0 {
+                                    selected -= 1;
+                                }
                                 if event == Event::Key(KeyCode::Enter.into())
-                                    || event == Event::Key(KeyCode::Tab.into())
-                                {
+                                    || event == Event::Key(KeyCode::Tab.into()) {
                                     let item = completion_result.items.get(selected).unwrap();
                                     self.lsp_completion_apply(item).await;
                                     return;
                                 }
-
-
                                 if event == Event::Key(KeyCode::Left.into()) {
                                     changed = true;
                                     self.handle_left();
@@ -2312,7 +2332,10 @@ impl Editor {
                                 match event {
                                     Event::Key(event) => {
                                         match event.code {
-                                            KeyCode::Char(' ') => { self.upd = true; return ;}
+                                            KeyCode::Char(' ') => {
+                                                self.upd = true;
+                                                return;
+                                            }
                                             KeyCode::Char(c) => {
                                                 changed = true;
                                                 self.insert_char(c).await;
@@ -2324,10 +2347,6 @@ impl Editor {
                                     },
                                     _ => {},
                                 }
-                                // KeyCode::Backspace => self.handle_delete().await,
-                                // KeyCode::Char('÷') => self.comment_line().await,
-                                // KeyCode::Char(c) => self.insert_char(c).await,
-
                             }
                             Some(Err(e)) => {debug!("Error: {:?}\r", e) },
                             None => break,
@@ -2336,42 +2355,71 @@ impl Editor {
                 };
             }
         }
-
     }
 
-    pub fn lsp_completion_draw(&mut self,
-        height: usize, width:usize,
-        options: &Vec<CompletionItem>,
-        selected:usize, offset:usize
+    pub fn draw_completion(
+        &mut self, height: usize, options: &Vec<CompletionItem>, selected: usize, offset: usize,
     ) {
-        let width = options.iter().map(|o| o.label.len()).max().unwrap_or(width);
+        let MAX_HEIGHT: usize = options.len().min(height);
+        let MAX_WIDTH: usize = 30;
 
-        for row in 0..height {
-            if row >= options.len() || row >= height { break; }
-            let option = &options[row + offset];
+        let ln_width = self.get_line_number_width();
+        let word_offset = self.code.offset(self.r, self.c);
+        let (word_start, _) = self.code.word_boundaries(word_offset);
+        let (word_start_row, word_start_col) = self.code.point(word_start);
 
-            let is_selected = selected == row + offset;
+        let max_label_width = options.iter().map(|o| o.label.len()).max().unwrap_or(MAX_WIDTH);
+
+        let cursor_screen_row = self.r - self.y;
+        let available_below = self.height.saturating_sub(cursor_screen_row + 1);
+
+        let visible_height = options.len().min(MAX_HEIGHT);
+
+        let draw_above = available_below < MAX_HEIGHT
+            && cursor_screen_row >= MAX_HEIGHT;
+
+        let from_y = if draw_above {
+            cursor_screen_row.saturating_sub(visible_height)
+        } else {
+            cursor_screen_row + 1
+        };
+
+        for row in 0..visible_height {
+            let i = row + offset;
+            if i >= options.len() {
+                break;
+            }
+
+            let option = &options[i];
+            let is_selected = selected == i;
             let bgcolor = if is_selected { Color::Grey } else { Color::Reset };
 
-            let label = format!(" {:width$} ", option.label, width = width);
+            let limit = self.width.saturating_sub(self.lp_width + ln_width + word_start_col);
+            let label = format!(" {:width$} ", option.label, width = max_label_width)
+                .chars()
+                .take(limit)
+                .collect::<String>();
 
-            queue!(stdout(),
-                cursor::MoveTo(
-                    (self.c + self.lp_width + self.ln_width + self.lns_width - 2) as u16,
-                    (self.r - self.y + row + 1) as u16
-                ),
-                BColor(bgcolor), FColor(self.lncolor),
+            let draw_row = from_y + row;
+            let draw_col = self.lp_width + ln_width + word_start_col - 1;
+
+            let _ = queue!(
+                stdout(),
+                cursor::MoveTo(draw_col as u16, draw_row as u16),
+                BColor(bgcolor),
+                FColor(self.lncolor),
                 Print(label),
-                BColor(Color::Reset), FColor(Color::Reset),
+                BColor(Color::Reset),
+                FColor(Color::Reset),
             );
         }
 
-        stdout().flush().expect("cant flush");
         self.draw_cursor();
-        stdout().flush().expect("cant flush");
     }
 
-    pub async fn lsp_completion_apply(&mut self, item: &lsp::lsp_messages::CompletionItem) {
+    pub async fn lsp_completion_apply(
+        &mut self, item: &lsp::lsp_messages::CompletionItem
+    ) {
         if item.textEdit.is_none() && item.label.is_empty() { return; }
 
         let line = match self.code.line_at(self.r) {
@@ -2399,6 +2447,7 @@ impl Editor {
         self.c = prev + insert_text.len();
         self.upd = true;
         self.clean_diagnostics();
+        self.reset_highlight_cache();
     }
 
     async fn definition(&mut self) {
@@ -2407,13 +2456,15 @@ impl Editor {
 
         let definition_result = match self.lang2lsp.get(lang) {
             Some(lsp) => lsp.lock().await.definition(&path, self.r, self.c).await,
-            None => { return; },
+            None => { return },
         };
 
         let definition = match &definition_result {
             Some(def) if def.len() == 1 => &def[0],
             _ => return,
         };
+
+        self.save_cursor_to_history();
 
         if definition.uri != format!("file://{}", self.code.abs_path) {
             let path = definition.uri.split("file://").nth(1).unwrap().to_string();
@@ -2428,20 +2479,20 @@ impl Editor {
 
         self.r = definition.range.start.line as usize;
         self.c = definition.range.start.character as usize;
-        self.handle_movement();
-
-        self.cursor_history.push(CursorPosition{
-            filename: self.code.abs_path.clone(),
-            row: self.r, col: self.c, y: self.y, x: self.x,
-        });
-        self.cursor_history_undo.clear();
+        self.focus();
+        self.save_cursor_to_history();
 
         self.upd = true;
         self.tree_view.upd = true;
     }
 
     pub async fn references(&mut self) {
-        let (r, c, initial_abs_path) = (self.r.clone(), self.c.clone(), self.code.abs_path.clone());
+        let saved_r = self.r.clone();
+        let saved_c = self.c.clone();
+        let saved_y = self.y.clone();
+        let saved_x = self.x.clone();
+        let saved_path = self.code.abs_path.clone();
+        self.save_cursor_to_history();
 
         loop {
             let start = Instant::now();
@@ -2484,7 +2535,8 @@ impl Editor {
 
                 self.r = reference.range.start.line as usize;
                 self.c = reference.range.start.character as usize;
-                self.handle_movement();
+                self.focus();
+                self.focus_to_center();
                 self.selection.set_start(reference.range.start.line as usize, reference.range.start.character as usize);
                 self.selection.set_end(reference.range.end.line as usize, reference.range.end.character as usize);
                 self.selection.activate();
@@ -2494,7 +2546,7 @@ impl Editor {
                 for i in fromy..=self.height { self.overlay_lines.insert(i); }
 
                 self.draw().await;
-                self.references_draw(height, width, fromy, &references, selected, selected_offset, elapsed);
+                self.draw_references(height, width, fromy, &references, selected, selected_offset, elapsed);
                 self.draw_cursor();
 
                 let mut event = reader.next().fuse();
@@ -2504,11 +2556,12 @@ impl Editor {
                         match maybe_event {
                             Some(Ok(event)) => {
                                 if event == Event::Key(KeyCode::Esc.into()) {
-                                    if self.code.abs_path != initial_abs_path {
-                                        self.open_file(&initial_abs_path).await;
+                                    if self.code.abs_path != saved_path {
+                                        self.open_file(&saved_path).await;
                                     }
-                                    self.r = r; self.c = c;
-                                    self.handle_movement();
+                                    self.r = saved_r; self.c = saved_c;
+                                    self.y = saved_y; self.x = saved_x;
+                                    self.focus();
                                     self.selection.clean();
 
                                     self.upd = true; self.tree_view.upd = true;
@@ -2526,6 +2579,7 @@ impl Editor {
                                 }
                                 if event == Event::Key(KeyCode::Enter.into())
                                 || event == Event::Key(KeyCode::Tab.into()) {
+                                    self.selection.clean();
                                     self.apply_reference(reference).await;
                                     self.overlay_lines.clear();
                                     return;
@@ -2541,26 +2595,21 @@ impl Editor {
     }
 
     async fn apply_reference(&mut self, reference: &ReferencesResult) {
+        self.save_cursor_to_history();
         if reference.uri != format!("file://{}", self.code.abs_path) {
             let path = reference.uri.split("file://").nth(1).unwrap().to_string();
             self.open_file(&path).await;
         }
-
         self.r = reference.range.start.line as usize;
         self.c = reference.range.start.character as usize;
-        self.handle_movement();
-
-        self.cursor_history.push(CursorPosition{
-            filename: self.code.abs_path.clone(),
-            row: self.r, col: self.c, y: self.y, x: self.x,
-        });
-        self.cursor_history_undo.clear();
-
+        self.focus();
+        self.save_cursor_to_history();
         self.upd = true;
         self.tree_view.upd = true;
     }
 
-    pub fn references_draw(&mut self,
+    pub fn draw_references(
+        &mut self,
         height: usize, width:usize, fromy:usize,
         options: &Vec<ReferencesResult>,
         selected: usize, offset: usize, elapsed:u128
@@ -2583,16 +2632,16 @@ impl Editor {
 
             let label = format!(" {:width$} ", option, width = width);
 
-            queue!(stdout(),
-                cursor::MoveTo((self.lp_width + self.ln_width + self.lns_width - 2) as u16, (row + fromy) as u16),
+            let _ = queue!(stdout(),
+                cursor::MoveTo(self.lp_width as u16, (row + fromy) as u16),
                 BColor(bgcolor), FColor(self.lncolor), Print(label),  BColor(Color::Reset), FColor(Color::Reset),
             );
         }
 
-        let status = format!("lsp references, elapsed {} ms", elapsed);
+        let status = format!("lsp references, elapsed {} ms {}", elapsed, " ".repeat(10));
 
-        queue!(stdout(),
-            cursor::MoveTo((self.lp_width + self.ln_width + self.lns_width - 2) as u16, (self.height-1) as u16),
+        let _ = queue!(stdout(),
+            cursor::MoveTo((self.lp_width) as u16, (self.height-1) as u16),
             BColor(Color::Reset), FColor(Color::Reset), Print(status),
         );
 
@@ -2627,10 +2676,9 @@ impl Editor {
 
             let options:Vec<String> = hover_result.contents.value.split("\n").map(|s| s.to_string()).collect();
 
-            if options.is_empty() { return; }
+            if options.is_empty() { return }
 
-            self.hover_draw(height, width, &options, selected, selected_offset);
-            self.upd_next = true;
+            self.draw_hover(height, &options, selected, selected_offset);
 
             let mut event = reader.next().fuse();
 
@@ -2638,13 +2686,26 @@ impl Editor {
                 maybe_event = event => {
                     match maybe_event {
                         Some(Ok(event)) => {
-                            if event == Event::Key(KeyCode::Esc.into()) { self.upd = true; break; }
-                            if event == Event::Key(KeyCode::Down.into()) && selected < options.len() - 1 { selected += 1;}
-                            if event == Event::Key(KeyCode::Up.into()) && selected > 0 { selected -= 1; }
+                            if event == Event::Key(KeyCode::Esc.into()) {
+                                self.upd = true;
+                                self.tree_view.upd = true;
+                                // self.clear_all();
+                                return ;
+                            }
+                            if event == Event::Key(KeyCode::Down.into())
+                                && selected < options.len() - 1 {
+                                selected += 1;
+                            }
+                            if event == Event::Key(KeyCode::Up.into())
+                                && selected > 0 {
+                                selected -= 1;
+                            }
                             if event == Event::Key(KeyCode::Enter.into())
-                                || event == Event::Key(KeyCode::Tab.into())
-                            {
-                                break
+                                || event == Event::Key(KeyCode::Tab.into()) {
+                                self.upd = true;
+                                self.tree_view.upd = true;
+                                // self.clear_all();
+                                return ;
                             }
                         }
                         Some(Err(e)) => {
@@ -2655,30 +2716,66 @@ impl Editor {
                 }
             }
         }
-
     }
 
-    pub fn hover_draw(&mut self,
-        height: usize, width:usize,
+    pub fn draw_hover(
+        &mut self,
+        height: usize,
         options: &Vec<String>,
-        selected: usize, offset: usize
+        selected: usize,
+        offset: usize,
     ) {
-        let width = options.iter().map(|o| o.len()).max().unwrap_or(width);
+        let MAX_HEIGHT: usize = options.len().min(height);
+        let MAX_WIDTH: usize = 80;
 
-        for row in 0..height {
-            if row >= options.len() || row >= height { break; }
-            let option = &options[row + offset];
+        let ln_width = self.get_line_number_width();
+        let word_offset = self.code.offset(self.r, self.c);
+        let (word_start, _) = self.code.word_boundaries(word_offset);
+        let (word_start_row, word_start_col) = self.code.point(word_start);
 
-            let bgcolor = if selected == row + offset { Color::Grey } else { Color::Reset };
+        let max_label_width = options.iter().map(|s| s.len()).max().unwrap_or(MAX_WIDTH);
 
-            let label = format!(" {:width$} ", option, width = width);
+        let cursor_screen_row = self.r - self.y;
+        let available_below = self.height.saturating_sub(cursor_screen_row + 1);
 
-            queue!(stdout(),
-                cursor::MoveTo(
-                    (self.c + self.lp_width + self.ln_width + self.lns_width - 2) as u16,
-                    (self.r - self.y + row + 1) as u16
-                ),
-                BColor(bgcolor), FColor(self.lncolor), Print(label),
+        let visible_height = options.len().min(MAX_HEIGHT);
+
+        let draw_above = available_below < MAX_HEIGHT
+            && cursor_screen_row >= MAX_HEIGHT;
+
+        let from_y = if draw_above {
+            cursor_screen_row.saturating_sub(visible_height)
+        } else {
+            cursor_screen_row + 1
+        };
+
+        for row in 0..visible_height {
+            let i = row + offset;
+            if i >= options.len() {
+                break;
+            }
+
+            let option = &options[i];
+            let is_selected = selected == i;
+            let bgcolor = if is_selected { Color::Grey } else { Color::Reset };
+
+            let limit = self.width.saturating_sub(self.lp_width + ln_width + word_start_col);
+            let label = format!(" {:width$} ", option, width = max_label_width)
+                .chars()
+                .take(limit)
+                .collect::<String>();
+
+            let draw_row = from_y + row;
+            let draw_col = self.lp_width + ln_width + word_start_col - 1;
+
+            let _ = queue!(
+                stdout(),
+                cursor::MoveTo(draw_col as u16, draw_row as u16),
+                BColor(bgcolor),
+                FColor(self.lncolor),
+                Print(label),
+                BColor(Color::Reset),
+                FColor(Color::Reset),
             );
         }
 
@@ -2687,10 +2784,12 @@ impl Editor {
     }
 
     pub async fn handle_errors(&mut self) {
-        let (r, c, initial_abs_path) = (self.r.clone(), self.c.clone(), self.code.abs_path.clone());
+        let saved_r = self.r.clone();
+        let saved_c = self.c.clone();
+        let saved_path = self.code.abs_path.clone();
 
         let (mut selected, mut selected_offset) = (0, 0);
-        let (height, mut width) = (5, 30);
+        let (height, width) = (3, 30);
         self.upd = true; self.tree_view.upd = true;
 
         let uri = format!("file://{}", self.code.abs_path);
@@ -2701,7 +2800,9 @@ impl Editor {
             let maybe_diagnostics = maybe_diagnostics.get(&uri);
 
             let diagnostics:Vec<Diagnostic> = match maybe_diagnostics {
-                Some(d) => d.diagnostics.iter().filter(|d| d.severity == 1).map(|d|d.clone()).collect(),
+                Some(d) => d.diagnostics.iter()
+                    // .filter(|d| d.severity == 1)
+                    .map(|d|d.clone()).collect(),
                 None => return,
             };
 
@@ -2721,20 +2822,16 @@ impl Editor {
                 Some(d) => d, None => { break },
             };
 
-            // if diagnostic.uri != format!("file://{}", &self.code.abs_path) {
-            //     let path = diagnostic.uri.split("file://").nth(1).unwrap().to_string();
-            //     self.open_file(&path).await;
-            // }
-
             self.r = diagnostic.range.start.line as usize;
             self.c = diagnostic.range.start.character as usize;
-            self.handle_movement();
-            self.selection.set_start(diagnostic.range.start.line as usize, diagnostic.range.start.character as usize);
-            self.selection.set_end(diagnostic.range.end.line as usize, diagnostic.range.end.character as usize);
-            self.selection.activate();
 
-            // self.draw().await;
-            self.diagnostic_draw(height, width, &diagnostics, selected, selected_offset);
+            let fromy = self.height.saturating_sub(std::cmp::min(height, diagnostics.len()));
+            for i in fromy.saturating_sub(1)..=self.height { self.overlay_lines.insert(i); }
+
+            self.focus();
+            self.focus_to_center();
+            self.draw().await;
+            self.draw_errors(height, width, fromy-1, &diagnostics, selected, selected_offset);
             self.draw_cursor();
 
             let mut event = reader.next().fuse();
@@ -2743,15 +2840,16 @@ impl Editor {
                 maybe_event = event => {
                     match maybe_event {
                         Some(Ok(event)) => {
-                            if event == Event::Key(KeyCode::Esc.into()) {
-                                if self.code.abs_path != initial_abs_path {
-                                    self.open_file(&initial_abs_path).await;
+                            if event == Event::Key(KeyCode::Enter.into()) {
+                                if self.code.abs_path != saved_path {
+                                    self.open_file(&saved_path).await;
                                 }
-                                self.r = r; self.c = c;
-                                self.handle_movement();
+                                self.focus();
                                 self.selection.clean();
-
-                                self.upd = true; self.tree_view.upd = true;
+                                self.upd = true;
+                                self.tree_view.upd = true;
+                                self.overlay_lines.clear();
+                                self.clear_all();
                                 return;
                             }
                             if event == Event::Key(KeyCode::Down.into()) && selected < diagnostics.len() - 1 {
@@ -2763,6 +2861,11 @@ impl Editor {
                                 selected -= 1;
                                 self.upd = true; self.tree_view.upd = true;
                             }
+                            if event == Event::Key(KeyCode::Char('c').into()) {
+                                let error = &diagnostics[selected];
+                                self.copy_to_clipboard(Some(error.message.clone()));
+                                return;
+                            }
 
                             if let Event::Resize(w, h) = event {
                                 self.upd = true;
@@ -2771,9 +2874,12 @@ impl Editor {
                                 self.draw().await;
                             }
 
-                            if event == Event::Key(KeyCode::Enter.into())
-                            || event == Event::Key(KeyCode::Tab.into()) {
-                                // self.apply_reference(diagnostic).await;
+                            if event == Event::Key(KeyCode::Esc.into()){
+                                self.r = saved_r; self.c = saved_c; // restore cursor
+                                self.upd = true;
+                                self.tree_view.upd = true;
+                                self.overlay_lines.clear();
+                                self.clear_all();
                                 return;
                             }
                         }
@@ -2783,85 +2889,86 @@ impl Editor {
                 }
             };
         }
+
+        self.overlay_lines.clear();
+        self.clear_all();
+        self.upd = true;
+        self.tree_view.upd = true;
     }
 
-    pub fn diagnostic_draw(&mut self,
-        height: usize, width:usize,
+    pub fn draw_errors(
+        &mut self,
+        height: usize, width: usize, fromy: usize,
         options: &Vec<Diagnostic>,
         selected: usize, offset: usize
     ) {
-
-        let limit = self.width - self.lp_width - self.ln_width - self.lns_width - 1;
+        let limit = self.width - self.lp_width - 1;
 
         let options: Vec<String> = options.iter().enumerate().map(|(i, diagnostic)| {
             let prefix = format!("{}/{} {}:{} ", i+1, options.len(),
                 diagnostic.range.start.line,
                 diagnostic.range.start.character,
             );
-            let message = diagnostic.message.chars().take(limit-prefix.len()).collect::<String>();
+            let message: String = diagnostic.message.chars().take(limit-prefix.len()).collect();
             format!("{}{}", prefix, message)
         }).collect();
-
-        let width = options.iter().map(|o| o.len()).max().unwrap_or(width);
 
         for row in 0..options.len() {
             if row >= options.len() || row >= height { break; }
             let option = &options[row + offset];
+            let message = option.replace("\n", " ").chars().take(limit).collect::<String>();
 
             let is_selected = selected == row + offset;
             let bgcolor = if is_selected { Color::Grey } else { Color::Reset };
 
-            let label = format!(" {:width$} ", option, width = width);
-
-            queue!(stdout(),
-                cursor::MoveTo((self.lp_width + self.ln_width + self.lns_width - 1) as u16, row  as u16),
-                BColor(bgcolor), FColor(self.lncolor), Print(label),  BColor(Color::Reset), FColor(Color::Reset),
+            let _ = queue!(stdout(),
+                cursor::MoveTo((self.lp_width) as u16, (row + fromy) as u16),
+                BColor(bgcolor), FColor(self.lncolor), Print(message),
+                terminal::Clear(ClearType::UntilNewLine), BColor(Color::Reset), FColor(Color::Reset),
             );
         }
 
-        stdout().flush().expect("cant flush");
+        let status = format!("Found {} problems {}", options.len(), " ".repeat(20));
+        let _ = queue!(stdout(),
+            cursor::MoveTo((self.lp_width) as u16, (self.height-1) as u16),
+            BColor(Color::Reset), FColor(Color::Reset), Print(status),
+        );
     }
 
-    pub async fn global_search(&mut self) {
-        if self.search.pattern.len_chars() == 0 { return; }
+    fn global_search(& self, pattern: &str) -> Vec<(String, SearchResult)> {
+        match search_in_directory(Path::new("./"), pattern) {
+            Ok(results) => results.into_iter()
+                .flat_map(|sr| {
+                    let path = sr.file_path;
+                    sr.search_results.into_iter().map(move |r| (path.clone(), r))
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
 
-        let (r, c, initial_abs_path) = (self.r.clone(), self.c.clone(), self.code.abs_path.clone());
+    pub async fn hanle_global_search(&mut self) {
+        if self.search.pattern.len_chars() == 0 { return }
+
+        let saved_r = self.r.clone();
+        let saved_c = self.c.clone();
+        let saved_selection = self.selection.clone();
+        let saved_path = self.code.abs_path.clone();
+
         let max_visible = 3;
         let mut changed = true;
         let (mut selected, mut selected_offset) = (0, 0);
-        let (mut height, mut width) = (max_visible, 30);
         self.upd = true; self.tree_view.upd = true;
 
         self.overlay_lines.clear();
 
-        let path = Path::new("./");
-        let mut search_results:Vec<(String, search::search::SearchResult)> = Vec::new();
-
         let start = Instant::now();
-        info!("Starting global search {:?} {} ms", &path, &self.search.pattern);
-        let search_res = search::search::search_in_directory(&path, &self.search.pattern.to_string());
+        let search_results = self.global_search(&self.search.pattern.to_string());
+        if search_results.is_empty() { return }
         let elapsed = start.elapsed().as_millis();
-        info!("Ending global search {:?} {} ms", &path, &self.search.pattern);
 
-        match search_res {
-            Ok(srs) => {
-                for sr in srs {
-                    for r in sr.search_results {
-                        search_results.push((sr.file_path.clone(), r));
-                    }
-                }
-
-                info!("found {} results elapsed {} ms", search_results.len(), elapsed);
-            },
-            Err(e) => {
-                error!("search error {}", e);
-                return
-            }
-        }
-
-        if search_results.is_empty() { return; }
-
-        if search_results.len() < height { height = search_results.len() }
+        let height = max_visible.min(search_results.len());
+        let width = self.width - self.lp_width - 1;
 
         let mut reader = EventStream::new();
 
@@ -2871,6 +2978,9 @@ impl Editor {
             if selected >= selected_offset + height { selected_offset = selected - height + 1 }
 
             if changed {
+                self.upd = true;
+                self.tree_view.upd = true;
+
                 let search_result = search_results.get(selected).unwrap();
 
                 if search_result.0 != self.code.abs_path {
@@ -2879,17 +2989,20 @@ impl Editor {
 
                 self.r = search_result.1.line-1;
                 self.c = search_result.1.column;
-                self.handle_movement();
+                self.focus();
                 self.focus_to_center();
                 self.selection.set_start(search_result.1.line-1, search_result.1.column);
-                self.selection.set_end(search_result.1.line-1, search_result.1.column + self.search.pattern.chars().count());
+                let pattern_len = self.search.pattern.chars().count();
+                self.selection.set_end(search_result.1.line-1, search_result.1.column + pattern_len);
                 self.selection.activate();
 
-                let fromy = self.height - std::cmp::min(max_visible, search_results.len());
-                for i in fromy-1..=self.height { self.overlay_lines.insert(i); }
+                let fromy = self.height.saturating_sub(max_visible.min(search_results.len()));
+                for i in fromy.saturating_sub(1)..=self.height { self.overlay_lines.insert(i); }
 
                 self.draw().await;
-                self.draw_search_result(height, width, fromy-1, &search_results, selected, selected_offset, elapsed);
+                self.draw_global_search_result(
+                    height, width, fromy-1, &search_results, selected, selected_offset, elapsed
+                );
                 self.draw_cursor();
                 changed = false;
             }
@@ -2901,42 +3014,38 @@ impl Editor {
                     match maybe_event {
                         Some(Ok(event)) => {
                             if event == Event::Key(KeyCode::Esc.into()) {
-                                if self.code.abs_path != initial_abs_path {
-                                    self.open_file(&initial_abs_path).await;
+                                if self.code.abs_path != saved_path {
+                                    self.open_file(&saved_path).await;
                                 }
-                                self.r = r; self.c = c;
-                                self.handle_movement();
+                                self.r = saved_r; self.c = saved_c;
+                                self.selection = saved_selection;
+                                self.focus();
                                 self.selection.clean();
 
                                 self.upd = true;
                                 self.tree_view.upd = true;
+                                self.clear_all();
                                 return;
                             }
-                            if event == Event::Key(KeyCode::Down.into()) && selected < search_results.len() - 1 {
-                                changed = true;
+                            if event == Event::Key(KeyCode::Down.into())
+                                && selected < search_results.len() - 1 {
                                 selected += 1;
-                                self.upd = true;
-                                // self.tree_view.upd = true;
+                                changed = true;
                             }
 
                             if event == Event::Key(KeyCode::Up.into()) && selected > 0 {
-                                changed = true;
                                 selected -= 1;
-                                self.upd = true;
-                                // self.tree_view.upd = true;
+                                changed = true;
                             }
 
                             if let Event::Resize(w, h) = event {
-                                self.upd = true;
-                                self.tree_view.upd = true;
                                 self.resize(w as usize, h as usize);
                                 changed = true;
                             }
 
                             if event == Event::Key(KeyCode::Enter.into())
-                            || event == Event::Key(KeyCode::Tab.into()) {
-                                self.upd = true;
-                                self.tree_view.upd = true;
+                                || event == Event::Key(KeyCode::Tab.into()) {
+                                self.clear_all();
                                 return;
                             }
                         }
@@ -2948,12 +3057,12 @@ impl Editor {
         }
     }
 
-    pub fn draw_search_result(&mut self,
+    pub fn draw_global_search_result(&mut self,
         height: usize, width:usize, fromy: usize,
-        options: &Vec<(String, search::search::SearchResult)>,
+        options: &Vec<(String, SearchResult)>,
         selected: usize, offset: usize, elapsed: u128
     ) {
-        let limit = self.width - self.lp_width - self.ln_width - self.lns_width - 1;
+        let limit = self.width - self.lp_width - 1;
 
         let options: Vec<String> = options.iter().enumerate().map(|(i, (path, sr))| {
             let prefix = format!("{}/{} {}:{} ", i+1, options.len(), sr.line,  sr.column);
@@ -2970,113 +3079,81 @@ impl Editor {
             let is_selected = selected == row + offset;
             let bgcolor = if is_selected { Color::Grey } else { Color::Reset };
 
-            let label = format!(" {:width$} ", option, width = width);
+            let label = format!("{:width$} ", option, width = width);
 
-            queue!(stdout(),
-                cursor::MoveTo((self.lp_width + self.ln_width + self.lns_width - 1) as u16, (row + fromy) as u16),
+            let _ = queue!(stdout(),
+                cursor::MoveTo((self.lp_width) as u16, (row + fromy) as u16),
                 BColor(bgcolor), FColor(self.lncolor), Print(label),
                 terminal::Clear(ClearType::UntilNewLine), BColor(Color::Reset), FColor(Color::Reset),
             );
         }
 
-        let status = format!(
-            "global search on '{}', elapsed {} ms",
-            &self.search.pattern,  elapsed
+        let status = format!("global search on '{}', elapsed {} ms {}",
+            &self.search.pattern, elapsed, " ".repeat(20)
         );
 
-        queue!(stdout(),
-            cursor::MoveTo((self.lp_width + 1) as u16, (self.height-1) as u16),
+        let _ = queue!(stdout(),
+            cursor::MoveTo((self.lp_width) as u16, (self.height-1) as u16),
             BColor(Color::Reset), FColor(Color::Reset), Print(status),
         );
 
-
         stdout().flush().expect("cant flush");
+    }
 
+    pub fn save_cursor_to_history(&mut self) {
+        if self.code.abs_path.is_empty() { return }
 
-        // draw inside left panel
-        // if self.lp_width == 0 { return; }
-        // let mut stdout = stdout();
-        // let limit = self.lp_width;
-
-        // let options: Vec<String> = options.iter().enumerate().map(|(i, (path, sr))| {
-        //     let prefix = format!("{}/{} {}:{} ", i+1, options.len(), sr.line,  sr.column);
-        //     let path = path.chars().take(limit-prefix.len()).collect::<String>();
-        //     format!("{} {}", prefix, path)
-        // }).collect();
-
-        // let mut count = 0;
-        // let mut row = 0;
-        // loop {
-        //     if row >= options.len() || row >= height { break; }
-        //     let option = &options[row + offset];
-
-        //     let isRowSelected = selected == row + offset;
-        //     let bgcolor = if isRowSelected { Color::Grey } else { Color::Reset };
-
-        //     let label = format!(" {:width$}", option, width = self.lp_width-3);
-
-        //     queue!(stdout,
-        //         cursor::MoveTo(1, row  as u16),
-        //         BColor(bgcolor), FColor(self.lncolor), Print(label),
-        //         BColor(Color::Reset), FColor(Color::Reset),
-        //     );
-
-        //     queue!(stdout, FColor(Color::DarkGrey), Print('│'));
-        //     count += 1;
-        //     row += 1;
-        // }
-
-        // while count < self.height { // fill empty space
-        //     queue!(stdout, cursor::MoveTo(0, count as u16));
-        //     queue!(stdout, Print(" ".repeat(self.lp_width-1)));
-        //     queue!(stdout, FColor(Color::DarkGrey), Print('│'));
-        //     count += 1;
-        // }
-        // stdout.flush().expect("cant flush");
+        let cp = CursorPosition {
+            filename: self.code.abs_path.clone(),
+            row: self.r.clone(),
+            col: self.c.clone(),
+            y: self.y.clone(),
+            x: self.x.clone(),
+        };
+        self.cursor_history.push(cp);
     }
 
     async fn undo_cursor(&mut self) {
-        match self.cursor_history.pop() {
-            Some(cursor_position) => {
-                self.cursor_history_undo.push(CursorPosition{
-                    filename: self.code.abs_path.clone(),
-                    row: self.r, col: self.c,
-                    y: self.y, x: self.x,
-                });
+        if let Some(prev) = self.cursor_history.current() {
+            if prev.row == self.r && prev.col == self.c && prev.filename == self.code.abs_path {
+                let _ = self.cursor_history.undo();
+            }
+        }
 
-                if cursor_position.filename != self.code.abs_path {
-                    self.open_file(&cursor_position.filename).await;
-                }
-                self.r = cursor_position.row;
-                self.c = cursor_position.col;
-                self.y = cursor_position.y;
-                self.x = cursor_position.x;
-                self.upd = true;
-                self.handle_movement();
-            },
-            None => {},
+        if let Some(history) = self.cursor_history.undo() {
+            if history.filename != self.code.abs_path {
+                self.open_file(&history.filename).await;
+            }
+
+            self.r = history.row;
+            self.c = history.col;
+            self.y = history.y;
+            self.x = history.x;
+            self.upd = true;
+            self.fit_cursor();
+            self.focus();
         }
     }
-    async fn redo_cursor(&mut self) {
-        match self.cursor_history_undo.pop() {
-            Some(cursor_position) => {
-                self.cursor_history.push(CursorPosition{
-                    filename: self.code.abs_path.clone(),
-                    row: self.r, col: self.c,
-                    y: self.y, x: self.x,
-                });
 
-                if cursor_position.filename != self.code.abs_path {
-                    self.open_file(&cursor_position.filename).await;
-                }
-                self.r = cursor_position.row;
-                self.c = cursor_position.col;
-                self.y = cursor_position.y;
-                self.x = cursor_position.x;
-                self.upd = true;
-                self.handle_movement();
-            },
-            None => {},
+    async fn redo_cursor(&mut self) {
+        if let Some(next) = self.cursor_history.peek_redo() {
+            if next.row == self.r && next.col == self.c && next.filename == self.code.abs_path {
+                let _ = self.cursor_history.redo();
+            }
+        }
+
+        if let Some(history) = self.cursor_history.redo() {
+            if history.filename != self.code.abs_path {
+                self.open_file(&history.filename).await;
+            }
+
+            self.r = history.row;
+            self.c = history.col;
+            self.y = history.y;
+            self.x = history.x;
+            self.upd = true;
+            self.fit_cursor();
+            self.focus();
         }
     }
 
@@ -3105,6 +3182,7 @@ impl Editor {
         self.selection.keep_once = false;
         self.upd = true;
         self.clean_diagnostics();
+        self.reset_highlight_cache();
     }
 
     async fn move_line_up(&mut self)  {
@@ -3186,6 +3264,6 @@ impl Editor {
 
 impl Drop for Editor {
     fn drop(&mut self) {
-        Self::deinit()
+        Self::deinit().expect("Error deinit")
     }
 }

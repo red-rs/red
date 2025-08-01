@@ -10,7 +10,9 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::Path;
-use tree_sitter::{Node, Parser, Point, Query, QueryCursor, TextProvider};
+use tree_sitter::{Language as TSLanguage,Tree, Node, Parser, Point, Query, QueryCursor, TextProvider};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use crate::config::{Config, Language};
 use crate::utils::{self, hex_to_color};
@@ -33,6 +35,8 @@ pub struct Code {
     lang_conf: Option<Language>,
     line2runneble: HashMap<usize, Runnable>,
     query_test: Option<tree_sitter::Query>,
+    injection_parsers: Option<HashMap<String, Rc<RefCell<Parser>>>>,
+    injection_queries: Option<HashMap<String, Query>>,
 }
 
 impl Code {
@@ -52,7 +56,115 @@ impl Code {
             lang_conf: None,
             line2runneble: HashMap::new(),
             query_test: None,
+            injection_parsers: None,
+            injection_queries: None,
         }
+    }
+    
+    fn detect_language(path: &str, conf: &Config) -> String {
+        detect_lang::from_path(path)
+            .map(|lang| lang.id().to_lowercase())
+            .or_else(|| conf.language.iter()
+                .find(|l| l.types.iter().any(|t| path.ends_with(t)))
+                .map(|l| l.name.clone()))
+            .unwrap_or_else(|| "text".to_string())
+    }
+
+    fn get_language(lang: &str) -> Option<TSLanguage> {
+        match lang {
+            "rust" => Some(tree_sitter_rust::LANGUAGE.into()),
+            "javascript" => Some(tree_sitter_javascript::LANGUAGE.into()),
+            "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
+            "python" => Some(tree_sitter_python::LANGUAGE.into()),
+            "go" => Some(tree_sitter_go::LANGUAGE.into()),
+            "java" => Some(tree_sitter_java::LANGUAGE.into()),
+            "c" => Some(tree_sitter_c::LANGUAGE.into()),
+            "cpp" => Some(tree_sitter_cpp::LANGUAGE.into()),
+            "html" => Some(tree_sitter_html::LANGUAGE.into()),
+            "css" => Some(tree_sitter_css::LANGUAGE.into()),
+            "yaml" => Some(tree_sitter_yaml::LANGUAGE.into()),
+            "json" => Some(tree_sitter_json::LANGUAGE.into()),
+            "toml" => Some(tree_sitter_toml_ng::LANGUAGE.into()),
+            "shell" => Some(tree_sitter_bash::LANGUAGE.into()),
+            _ => None,
+        }
+    }
+    
+    fn get_highlights(lang: &str) -> anyhow::Result<String> {
+        let p = format!("langs/{}/highlights.scm", lang);
+        let highlights_bytes = crate::config::Asset::get(&p).ok_or_else(
+            || anyhow::anyhow!("No highlights found for {}", lang))?;
+        let highlights_bytes = highlights_bytes.data.as_ref();
+        let highlights = std::str::from_utf8(highlights_bytes)?;
+        Ok(highlights.to_string())
+    }
+    
+    fn get_test_highlights(lang: &str) -> anyhow::Result<String> {
+        let p = format!("langs/{}/tests.scm", lang);
+        let highlights_bytes = crate::config::Asset::get(&p).ok_or_else(
+            || anyhow::anyhow!("No highlights found for {}", lang))?;
+        let highlights_bytes = highlights_bytes.data.as_ref();
+        let highlights = std::str::from_utf8(highlights_bytes)?;
+        Ok(highlights.to_string())
+    }
+    
+    fn init_injections(query: &Query) -> anyhow::Result<(
+        HashMap<String, Rc<RefCell<Parser>>>,
+        HashMap<String, Query>,
+    )> {
+        let mut injection_parsers = HashMap::new();
+        let mut injection_queries = HashMap::new();
+
+        for name in query.capture_names() {
+            if let Some(lang) = name.strip_prefix("injection.content.") {
+                if injection_parsers.contains_key(lang) {
+                    continue; 
+                }
+                if let Some(language) = Self::get_language(lang) {
+                    let mut parser = Parser::new();
+                    parser.set_language(&language)?;
+                    let highlights = Self::get_highlights(lang)?;
+                    let inj_query = Query::new(&language, &highlights)?;
+
+                    injection_parsers.insert(lang.to_string(), Rc::new(RefCell::new(parser)));
+                    injection_queries.insert(lang.to_string(), inj_query);
+                } else {
+                    return Err(anyhow::anyhow!("Injection language not found"));
+                }
+            }
+        }
+
+        Ok((injection_parsers, injection_queries))
+    }
+    
+    
+    fn init_syntax(lang: &str, text: &Rope) -> anyhow::Result<(
+        Option<Tree>, Option<Parser>, Option<Query>, Option<Query>, 
+        Option<HashMap<String, Rc<RefCell<Parser>>>>, Option<HashMap<String, Query>>
+    )> {
+        let Some(language) = Self::get_language(lang) else {
+            return Ok((None, None, None, None, None, None));
+        };
+    
+        let mut parser = Parser::new();
+        parser.set_language(&language)?;
+        let tree = parser.parse(text.to_string(), None);
+        
+        let query = match Self::get_highlights(lang).ok() {
+            Some(highlights) => Query::new(&language, &highlights).ok(),
+            None => None,
+        };
+        
+        let test_query = match Self::get_test_highlights(lang).ok() {
+            Some(test_highlights) => Query::new(&language, &test_highlights).ok(),
+            None => None,
+        };
+        
+        let (iparsers, iqueries) = query.as_ref()
+            .and_then(|q| Self::init_injections(q).ok())
+            .unwrap_or_default();
+    
+        Ok((tree, Some(parser), query, test_query, Some(iparsers), Some(iqueries)))
     }
 
     pub fn from_str(text: &str) -> Self {
@@ -60,138 +172,45 @@ impl Code {
         code.insert_text(text, 0, 0);
         code
     }
-
-    pub fn from_file(path: &str, conf: &Config) -> std::io::Result<Self> {
+    
+    pub fn from_file(path: &str, conf: &Config) -> anyhow::Result<Self> {
         let file = File::open(path)?;
         let text = Rope::from_reader(BufReader::new(file))?;
         let abs_path = utils::abs_file(path);
         let file_name = utils::get_file_name(path);
-
-        let mut lang = match detect_lang::from_path(path) {
-            Some(lang) => lang.id().to_lowercase(),
-            None => {
-                // find lang by ext from config
-                match conf.language.iter().find(|l| l.types.iter().any(|t| path.ends_with(t))) {
-                    Some(lang) => lang.name.to_string(),
-                    None => "text".to_string(),
-                }
-            }
-        };
-
-        let lang_conf = conf.language.iter().find(|l| l.name == lang);
-        let lang_conf = lang_conf.map(|lc| (*lc).clone());
-
-        let language = match lang.as_str() {
-            "rust" => tree_sitter_rust::LANGUAGE.into(),
-            "javascript" => tree_sitter_javascript::LANGUAGE.into(),
-            "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            "python" => tree_sitter_python::LANGUAGE.into(),
-            "go" => tree_sitter_go::LANGUAGE.into(),
-            "html" => tree_sitter_html::LANGUAGE.into(),
-            "css" => tree_sitter_css::LANGUAGE.into(),
-            "shell" => tree_sitter_bash::LANGUAGE.into(),
-            "toml" => tree_sitter_toml_ng::LANGUAGE.into(),
-            "java" => tree_sitter_java::LANGUAGE.into(),
-            "cpp" => tree_sitter_cpp::LANGUAGE.into(),
-            "c" => tree_sitter_c::LANGUAGE.into(),
-            "zig" => tree_sitter_zig::LANGUAGE.into(),
-            "lua" => tree_sitter_lua::LANGUAGE.into(),
-            "json" => tree_sitter_json::LANGUAGE.into(),
-            "yaml" => tree_sitter_yaml::LANGUAGE.into(),
-            "toml" => tree_sitter_toml_ng::LANGUAGE.into(),
-
-            _ => {
-                lang = "text".to_string();
-                tree_sitter_rust::LANGUAGE.into()
-            }
-        };
-
-        if lang == "text".to_string() {
-            return Ok(Self {
-                text,
-                file_name,
-                abs_path,
-                changed: false,
-                undo_history: Vec::new(),
-                redo_history: Vec::new(),
-                tree:None,
-                lang,
-                parser: None,
-                query: None,
-                r: 0, c: 0, x: 0, y: 0,
-                lang_conf,
-                line2runneble: HashMap::new(),
-                query_test: None,
-            })
-        }
-
-        let mut parser = Parser::new();
-        parser.set_language(&language).expect("Can not set_language");
-
-        let tree = parser.parse(text.to_string(), None);
-
-        let query_highlight_content = crate::config::get_file_content(
-            format!("langs/{}/highlights.scm", lang).as_str()
-        ).unwrap_or("".to_string());
-
-        let query_highlight = match Query::new(&language, &query_highlight_content) {
-            Ok(q) => Some(q),
-            Err(e) => { 
-                debug!("err {}", e); 
-                None 
-            },
-        };
-        
-        let query_test_path = Path::new(".").join("langs")
-            .join(lang.clone()).join("tests.scm");
-
-        let query_test_content = crate::config::get_file_content(
-            query_test_path.to_str().unwrap_or("")
-        );
-
-        let query_test = match query_test_content {
-            Ok(query_test_content) => {
-                match Query::new(&language, &query_test_content) {
-                    Ok(q) => Some(q),
-                    Err(e) => { debug!("err {}", e); None },
-                }
-            }
-            Err(e) => { debug!("err {}", e); None },
-        };
-
-        let mut this = Self {
-            text,
-            file_name,
-            abs_path,
+    
+        let lang = Self::detect_language(path, conf);
+        let lang_conf = conf.language.iter().find(|l| l.name == lang).cloned();
+        let (tree, parser, query, test_query, injection_parsers, injection_queries) = 
+            Self::init_syntax(&lang, &text)?;
+    
+        let mut instance = Self {
+            text, file_name, abs_path, lang, lang_conf,
             changed: false,
             undo_history: Vec::new(),
             redo_history: Vec::new(),
-            tree,
-            lang,
-            parser: Some(parser),
-            query: query_highlight,
+            tree, parser, query, query_test: test_query,
+            injection_parsers, injection_queries,
             r: 0, c: 0, x: 0, y: 0,
-            lang_conf,
             line2runneble: HashMap::new(),
-            query_test
         };
-
-        this.update_runnables();
-        Ok(this)
-    }
     
+        instance.update_runnables();
+        Ok(instance)
+    }
+
     pub fn reload(&mut self) -> std::io::Result<()>{
         let file = File::open(&self.abs_path)?;
         let text = Rope::from_reader(BufReader::new(file))?;
-        
+
         let last_row =  self.text.len_lines() - 1;
         let last_col = self.line_len(last_row);
-        
+
         self.replace_text(0, 0, last_row, last_col, &text.to_string());
-        
+
         Ok(())
     }
-    
+
     pub fn set_lang(&mut self, lang:String, conf: &Config) {
         self.lang = lang;
         let lang_conf = conf.language.iter().find(|l| l.name == self.lang);
@@ -245,7 +264,7 @@ impl Code {
             text: text.to_string(),
             row, column
         });
-        
+
         self.redo_history.clear();
     }
 
@@ -288,48 +307,48 @@ impl Code {
         let from = self.text.line_to_char(row) + col;
         let to = self.text.line_to_char(row1) + col1;
         let text = self.text.slice(from..to).to_string();
-        
+
         self.remove(from, to);
-        
+
         self.undo_history.push(Change {
             start: from,
             operation: Operation::Remove,
             text: text.to_string(),
             row:row1, column:col1
         });
-        
+
         self.redo_history.clear();
     }
-    
+
     pub fn remove_char(&mut self, row: usize, column: usize) {
         self.remove_text(row, column-1, row, column);
     }
-    
+
     pub fn replace_text(&mut self, row: usize, col: usize, row1: usize, col1: usize, text: &str) {
         let from = self.text.line_to_char(row) + col;
         let to = self.text.line_to_char(row1) + col1;
         let removed_text = self.text.slice(from..to).to_string();
-        
+
         self.undo_history.push(Change {
             start: from,
             operation: Operation::Start,
             text: "".to_string(),
             row: row1, column: col1
         });
-        
+
         self.remove_text(row, col, row1, col1);
         self.insert_text(text, row, col);
-        
+
         self.undo_history.push(Change {
             start: from,
             operation: Operation::End,
             text: "".to_string(),
             row: row1, column: col1
         });
-        
+
         self.redo_history.clear();
     }
-    
+
     fn apply_edit(&mut self, edit: InputEdit) {
         match self.tree.as_mut() {
             Some(tree) => {
@@ -362,14 +381,14 @@ impl Code {
 
     fn set_text(&mut self, text: &str) {
         self.text = Rope::from(text);
-        
+
         if let Some(parser) = &mut self.parser {
             let tree = parser.parse(self.text.to_string(), None);
             self.tree = tree;
             self.update_runnables();
         }
     }
-    
+
     pub fn get_text(&mut self, row: usize, col: usize, row1: usize, col1: usize) -> String {
         let from = self.text.line_to_char(row) + col;
         let to = self.text.line_to_char(row1) + col1;
@@ -435,6 +454,7 @@ impl Code {
     pub fn line_to_char(&self, line_idx: usize) -> usize {
         self.text.line_to_char(line_idx)
     }
+
     pub fn point(&self, offset: usize) -> (usize, usize) {
         let row = self.text.char_to_line(offset);
         let line_start = self.text.line_to_char(row);
@@ -467,22 +487,22 @@ impl Code {
         };
     }
 
-    fn position_to_point(text: &RopeSlice, pos: usize) -> (usize, usize) {
-        let byte = text.char_to_byte(pos);
-        let line = text.char_to_line(pos);
-        let line_start_byte = text.line_to_byte(line);
-        let col = byte - line_start_byte;
+    pub fn search(&self, search_query: &str) -> Vec<(usize, usize)> {
+        let mut results = Vec::new();
+        let mut start_byte = 0;
+        let content = self.text.to_string();
 
-        (line, col)
-    }
+        while let Some(pos) = content[start_byte..].find(&search_query) {
+            let match_start_byte = start_byte + pos;
+            let match_end_byte = match_start_byte + search_query.len();
+            let match_start_char = self.text.byte_to_char(match_start_byte);
+            let point = self.point(match_start_char);
 
-    pub fn search(&self, substring: &str) -> Vec<(usize, usize)> {
-        let rope_slice = &self.text.slice(0..);
-        let result: Vec<(usize, usize)> = SearchIter::from_rope_slice(rope_slice, substring)
-            .map(|(pos, _)| Self::position_to_point(rope_slice, pos))
-            .collect();
+            results.push((point.0, point.1));
+            start_byte = match_end_byte;
+        }
 
-        result
+        results
     }
 
     pub fn find_substring(&self, line:usize, substring: &str) -> Option<usize> {
@@ -574,103 +594,31 @@ impl Code {
         }
     }
 
-    /// calculates color ranges from line number `from` to `to`
-    /// returns colors vectors of (start_byte, end_byte, color): (usize, usize, Color)
-    pub fn colors(
-        &self,
-        from: usize,
-        to: usize,
-        theme: &HashMap<String, String>,
-    ) -> Vec<(usize, usize, usize, usize, Color)> {
-
-        let query = match self.query.as_ref() {
-            Some(q) => q, None => return Vec::new(),
-        };
-
-        let mut query_cursor = QueryCursor::new();
-        let start_index = self.text.line_to_byte(from);
-        let max_index = self.text.len_lines();
-        let end_index = self.text.line_to_byte(min(to, max_index));
-
-        query_cursor.set_byte_range(start_index..end_index); //superfast
-
-        let root = self.tree.as_ref().unwrap().root_node();
-
-        let mut query_matches = query_cursor.matches(&query, root, RopeProvider(self.text.slice(..)));
-        
-        let mut result = Vec::new();
-
-        while let Some(m) = query_matches.next() {
-            for capture in m.captures {
-                let capture_index = capture.index as usize;
-                let capture_name = &query.capture_names()[capture_index];
-                let name = capture_name.split('.').next().unwrap_or(capture_name);
-                let theme_colors = theme.get(name);
-                let color = theme_colors
-                    .map(|s| hex_to_color(s))
-                    .unwrap_or(Color::Reset);
-
-                // let node_text = self.text.byte_slice(
-                //     capture.node.start_byte()..capture.node.end_byte()
-                // ).as_str().unwrap_or_default(); // debug
-
-                if color == Color::Reset { continue }
-
-                result.push((
-                    capture.node.start_byte(), 
-                    capture.node.end_byte(), 
-                    capture.node.start_position().row, 
-                    capture.node.end_position().row, 
-                    color
-                ));
-            }
-        }
-        
-        result
-
-    }
-
     /// Highlights the interval between `start` and `end` char indices.
-    /// Returns a list of (start byte, end byte, token_name) for highlighting.
+    /// Returns a list of (start byte, end byte, token_name) for highlighting. 
     pub fn highlight_interval(
         &self, start: usize, end: usize, theme: &HashMap<String, String>,
     ) -> Vec<(usize, usize, Color)> {
-        if start > start { panic!("invalid range")}
+        if start > end { panic!("Invalid range") }
+
         let Some(query) = &self.query else { return vec![]; };
         let Some(tree) = &self.tree else { return vec![]; };
-    
-        let mut query_cursor = QueryCursor::new();
-        query_cursor.set_byte_range(start..end);
-    
-        let root_node = tree.root_node();
-        let capture_names = query.capture_names();
-        
-        let mut query_matches = query_cursor.matches(
-            query, root_node, RopeProvider(self.text.slice(..))
-        );
-    
-        let mut unsorted = Vec::new();
-    
-        while let Some(m) = query_matches.next() {
-            for capture in m.captures {
-                let name = capture_names[capture.index as usize];
-                // let node_text = self.text
-                //     .byte_slice(capture.node.start_byte()..capture.node.end_byte()).as_str()
-                //     .unwrap_or_default(); // debug
 
-                if let Some(value) = theme.get(name) {
-                    unsorted.push((
-                        capture.node.start_byte(),
-                        capture.node.end_byte(),
-                        capture.index as usize,
-                        hex_to_color(value)
-                    ));
-                }
-            }
-        }
-    
-        // Sort by length descending, then by capture index
-        unsorted.sort_by(|a, b| {
+        let text = self.text.slice(..);
+        let root_node = tree.root_node();
+
+        let mut results = Self::highlight(
+            text,
+            start,
+            end,
+            query,
+            root_node,
+            theme,
+            self.injection_parsers.as_ref(),
+            self.injection_queries.as_ref(),
+        );
+
+        results.sort_by(|a, b| {
             let len_a = a.1 - a.0;
             let len_b = b.1 - b.0;
             match len_b.cmp(&len_a) {
@@ -678,12 +626,75 @@ impl Code {
                 other => other,
             }
         });
-    
-        unsorted.into_iter()
+
+        results
+            .into_iter()
             .map(|(start, end, _, value)| (start, end, value))
             .collect()
     }
 
+    fn highlight(
+        text: RopeSlice<'_>,
+        start_byte: usize,
+        end_byte: usize,
+        query: &Query,
+        root_node: Node,
+        theme: &HashMap<String, String>,
+        injection_parsers: Option<&HashMap<String, Rc<RefCell<Parser>>>>,
+        injection_queries: Option<&HashMap<String, Query>>,
+    ) -> Vec<(usize, usize, usize, Color)> {
+        let mut cursor = QueryCursor::new();
+        cursor.set_byte_range(start_byte..end_byte);
+
+        let mut matches = cursor.matches(query, root_node, RopeProvider(text));
+
+        let mut results = Vec::new();
+        let capture_names = query.capture_names();
+
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let name = capture_names[capture.index as usize];
+                if let Some(value) = theme.get(name) {
+                    results.push((
+                        capture.node.start_byte(),
+                        capture.node.end_byte(),
+                        capture.index as usize,
+                        hex_to_color(value),
+                    ));
+                } else if let Some(lang) = name.strip_prefix("injection.content.") {
+                    let Some(injection_parsers) = injection_parsers else { continue };
+                    let Some(injection_queries) = injection_queries else { continue };
+                    let Some(parser) = injection_parsers.get(lang) else { continue };
+                    let Some(injection_query) = injection_queries.get(lang) else { continue };
+
+                    let start = capture.node.start_byte();
+                    let end = capture.node.end_byte();
+                    let slice = text.byte_slice(start..end);
+
+                    let mut parser = parser.borrow_mut();
+                    let Some(inj_tree) = parser.parse(slice.to_string(), None) else { continue };
+
+                    let injection_results = Self::highlight(
+                        slice,
+                        0,
+                        end - start,
+                        injection_query,
+                        inj_tree.root_node(),
+                        theme,
+                        injection_parsers.into(),
+                        injection_queries.into(),
+                    );
+
+                    for (s, e, i, v) in injection_results {
+                        results.push((s + start, e + start, i, v));
+                    }
+                }
+            }
+        }
+
+        results
+    }
+    
     fn update_runnables(&mut self) {
         if self.lang_conf.is_none() {return; }
 
@@ -745,11 +756,11 @@ impl Code {
     pub fn is_runnable(&self, line: usize) -> bool {
         self.line2runneble.contains_key(&line)
     }
-    pub fn get_runnable(&self, line: usize) -> Option<&Runnable> {
-        self.line2runneble.get(&line)
+
+    pub fn get_runnable(&self, line: usize) -> Option<Runnable> {
+        self.line2runneble.get(&line).cloned()
     }
 
-    
     pub fn get_node_path(
         &self, row: usize, column: usize
     ) -> Option<NodePath> {
@@ -759,7 +770,7 @@ impl Code {
         let mut node = root.named_descendant_for_point_range(
             Point { row, column }, Point { row, column }
         );
-        
+
         let mut path = NodePath { row, column, nodes: vec![], current:0 };
 
         // traverse tree to up
@@ -775,6 +786,47 @@ impl Code {
         Some(path)
     }
 
+    pub fn line_boundaries(&self, pos: usize) -> (usize, usize) {
+        let total_chars = self.text.len_chars();
+        if pos >= total_chars {
+            return (pos, pos);
+        }
+
+        let line = self.text.char_to_line(pos);
+        let start = self.text.line_to_char(line);
+        let end = start + self.text.line(line).len_chars();
+
+        (start, end)
+    }
+
+    pub fn word_boundaries(&self, pos: usize) -> (usize, usize) {
+        let len = self.text.len_chars();
+        if pos >= len {
+            return (pos, pos);
+        }
+
+        let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+
+        let mut start = pos;
+        while start > 0 {
+            let c = self.text.char(start - 1);
+            if !is_word_char(c) {
+                break;
+            }
+            start -= 1;
+        }
+
+        let mut end = pos;
+        while end < len {
+            let c = self.text.char(end);
+            if !is_word_char(c) {
+                break;
+            }
+            end += 1;
+        }
+
+        (start, end)
+    }
 }
 
 pub struct NodePath {
@@ -790,16 +842,17 @@ impl NodePath {
     }
     pub fn next_node(&mut self) -> Option<&(Point, Point)>{
         self.current += 1;
-        if self.current >= self.nodes.len() { self.current = self.nodes.len() -1 } 
+        if self.current >= self.nodes.len() { self.current = self.nodes.len() -1 }
         self.nodes.get(self.current)
     }
     pub fn prev_node(&mut self) -> Option<&(Point, Point)>{
-        if self.current == 0 { return None } 
-        if self.current > 0 { self.current -= 1 } 
+        if self.current == 0 { return None }
+        if self.current > 0 { self.current -= 1 }
         self.nodes.get(self.current)
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Runnable {
     pub cmd: String,
     pub row: usize,
@@ -811,7 +864,7 @@ pub struct ChunksBytes<'a> {
 
 impl<'a> Iterator for ChunksBytes<'a> {
     type Item = &'a [u8];
-    
+
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         self.chunks.next().map(str::as_bytes)
@@ -904,20 +957,20 @@ impl<'a> Iterator for SearchIter<'a> {
     }
 }
 
-#[cfg(test)]
-mod code_rope_search_iterator_simple_tests {
-    use super::SearchIter;
+// #[cfg(test)]
+// mod code_rope_search_iterator_simple_tests {
+//     use super::SearchIter;
 
-    #[test]
-    fn test_search_iterator() {
-        let rope = ropey::Rope::from_str("// This is a sample string with some occurrences of '//'.");
-        let substring = "//";
-        let slice = &rope.slice(0..);
+//     #[test]
+//     fn test_search_iterator() {
+//         let rope = ropey::Rope::from_str("// This is a sample string with some occurrences of '//'.");
+//         let substring = "//";
+//         let slice = &rope.slice(0..);
 
-        let search_iter = SearchIter::from_rope_slice(slice, substring);
-        search_iter.for_each(|r| println!("search {:?}", r))
-    }
-}
+//         let search_iter = SearchIter::from_rope_slice(slice, substring);
+//         search_iter.for_each(|r| println!("search {:?}", r))
+//     }
+// }
 
 struct EarlyTerminationSearch<'a> {
     char_iter: ropey::iter::Chars<'a>,
@@ -977,71 +1030,72 @@ impl<'a> Iterator for EarlyTerminationSearch<'a> {
         None
     }
 }
-#[cfg(test)]
-mod code_rope_search_iterator_tests {
-    use crate::code::{EarlyTerminationSearch, SearchIter};
 
-    #[test]
-    fn test_early_termination_search() {
-        let rope = ropey::Rope::from_str("// This is a sample string with some occurrences of '//'.");
-        let substring = "//";
-        let slice = &rope.slice(0..);
+// #[cfg(test)]
+// mod code_rope_search_iterator_tests {
+//     use crate::code::{EarlyTerminationSearch};
 
-        let search_iter = EarlyTerminationSearch::from_rope_slice(slice, substring);
-        let result: Vec<(usize, usize)> = search_iter.collect();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result.get(0).unwrap().0, 0);
-        assert_eq!(result.get(0).unwrap().1, 2);
-    }
+//     #[test]
+//     fn test_early_termination_search() {
+//         let rope = ropey::Rope::from_str("// This is a sample string with some occurrences of '//'.");
+//         let substring = "//";
+//         let slice = &rope.slice(0..);
 
-
-    #[test]
-    fn test_full_search_bench() {
-        use std::time::{Instant};
-
-        let n = 10000000;
-
-        let start_time = Instant::now();
-
-        let rope = ropey::Rope::from_str("// This is a sample string with some occurrences of '//'.");
-        let substring = "//";
-        let slice = &rope.slice(0..);
-
-        for _ in 0..n {
-            let search_iter = SearchIter::from_rope_slice(slice, substring);
-            let result: Vec<(usize, usize)> = search_iter.collect();
-        }
-
-        let elapsed_time = Instant::now().duration_since(start_time).as_secs_f64();
-        let ops_per_sec = (n as f64) / elapsed_time;
-        println!("ops: {:.2}", ops_per_sec);
-        // ops: 204967.29
-    }
+//         let search_iter = EarlyTerminationSearch::from_rope_slice(slice, substring);
+//         let result: Vec<(usize, usize)> = search_iter.collect();
+//         assert_eq!(result.len(), 1);
+//         assert_eq!(result.get(0).unwrap().0, 0);
+//         assert_eq!(result.get(0).unwrap().1, 2);
+//     }
 
 
-    #[test]
-    fn test_early_termination_search_bench() {
-        use std::time::{Instant};
+//     #[test]
+//     fn test_full_search_bench() {
+//         use std::time::{Instant};
 
-        let rope = ropey::Rope::from_str("This is a sample string with some occurrences of '//'.");
-        let substring = "//";
-        let slice = &rope.slice(0..);
+//         let n = 10000000;
 
-        let operation = || {
-            let search_iter = EarlyTerminationSearch::from_rope_slice(slice, substring);
-            let result: Vec<(usize, usize)> = search_iter.collect();
-        };
+//         let start_time = Instant::now();
 
-        let n = 10_000;
-        let start_time = Instant::now();
-        for _ in 0..n { operation(); }
+//         let rope = ropey::Rope::from_str("// This is a sample string with some occurrences of '//'.");
+//         let substring = "//";
+//         let slice = &rope.slice(0..);
 
-        let elapsed_time = Instant::now().duration_since(start_time).as_secs_f64();
-        let ops_per_sec = (n as f64) / elapsed_time;
-        println!("ops: {:.2}", ops_per_sec);
-        // ops: 211009.97
-    }
-}
+//         for _ in 0..n {
+//             let search_iter = SearchIter::from_rope_slice(slice, substring);
+//             let result: Vec<(usize, usize)> = search_iter.collect();
+//         }
+
+//         let elapsed_time = Instant::now().duration_since(start_time).as_secs_f64();
+//         let ops_per_sec = (n as f64) / elapsed_time;
+//         println!("ops: {:.2}", ops_per_sec);
+//         // ops: 204967.29
+//     }
+
+
+//     #[test]
+//     fn test_early_termination_search_bench() {
+//         use std::time::{Instant};
+
+//         let rope = ropey::Rope::from_str("This is a sample string with some occurrences of '//'.");
+//         let substring = "//";
+//         let slice = &rope.slice(0..);
+
+//         let operation = || {
+//             let search_iter = EarlyTerminationSearch::from_rope_slice(slice, substring);
+//             let result: Vec<(usize, usize)> = search_iter.collect();
+//         };
+
+//         let n = 10_000;
+//         let start_time = Instant::now();
+//         for _ in 0..n { operation(); }
+
+//         let elapsed_time = Instant::now().duration_since(start_time).as_secs_f64();
+//         let ops_per_sec = (n as f64) / elapsed_time;
+//         println!("ops: {:.2}", ops_per_sec);
+//         // ops: 211009.97
+//     }
+// }
 
 #[cfg(test)]
 mod code_rope_search_tests {

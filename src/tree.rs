@@ -24,6 +24,7 @@ impl TreeNode {
     pub fn new(name:String, fullpath:String, is_file: bool) -> Self {
         Self { name, fullpath, is_file, children: None }
     }
+    pub fn name(&self) -> &String { &self.name }
     pub fn print(&self) { println!("node {:?}", self); }
     pub fn is_file(&mut self) -> bool { self.is_file }
     pub fn fullpath(&mut self) -> String { self.fullpath.clone() }
@@ -346,7 +347,7 @@ impl TreeView {
         queue!(stdout,cursor::Show, cursor::MoveTo(0, (self.height -1) as u16));
         queue!(stdout, Print(&search));
         queue!(stdout, Print(" ".repeat(self.width-search.len()-1)));
-        queue!(stdout, FColor(Color::DarkGrey), Print('│'));
+        // queue!(stdout, FColor(Color::DarkGrey), Print('│'));
         queue!(stdout, cursor::MoveTo((prefix.len() + self.search.index) as u16, (self.height -1) as u16));
         // stdout.flush();
     }
@@ -416,6 +417,33 @@ impl TreeView {
             }
         }
         None
+    }
+    
+    fn find_by_index_with_depth<'a>(
+        node: &'a mut TreeNode,
+        index: usize,
+        count: &mut usize,
+        depth: usize,
+    ) -> Option<(&'a mut TreeNode, usize)> {
+        if *count == index {
+            return Some((node, depth));
+        }
+    
+        if let Some(children) = &mut node.children {
+            for child in children {
+                *count += 1;
+                if let Some(found) = Self::find_by_index_with_depth(child, index, count, depth + 1) {
+                    return Some(found);
+                }
+            }
+        }
+    
+        None
+    }
+    
+    pub fn find_with_depth<'a>(&'a mut self, index: usize) -> Option<(&'a mut TreeNode, usize)> {
+        let mut count = 0;
+        Self::find_by_index_with_depth(&mut self.root, index + self.y, &mut count, 0)
     }
     
     fn find_by_index_expand(node: &mut TreeNode, index: usize, count: &mut usize) -> bool {

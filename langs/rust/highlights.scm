@@ -32,7 +32,7 @@
 ; Extraneous
 ; ---
 
-(self) @variable.builtin
+(self) @keyword
 (enum_variant (identifier) @type.enum.variant)
 
 (field_initializer

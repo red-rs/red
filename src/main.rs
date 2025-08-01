@@ -16,23 +16,21 @@ use log2::*;
 
 #[tokio::main]
 async fn main() {
-    // Handle --help or -h
     if let Some(arg) = std::env::args().nth(1) {
         if arg == "--help" || arg == "-h" {
-            print_help_and_exit();
+            print_help();
+            std::process::exit(0);
         }
     }
 
-    let current_dir = utils::current_directory_name().unwrap();
-
-    let logger = match std::env::var("RED_LOG") {
+    let _logger = match std::env::var("RED_LOG") {
         Ok(p) => Some(log2::open(&p).start()),
         Err(_) => None,
     };
 
     debug!("starting red");
 
-    let mut editor = Editor::new(current_dir, config::get());
+    let mut editor = Editor::new(config::get());
 
     editor.handle_panic();
 
@@ -43,6 +41,7 @@ async fn main() {
         Some(path) => {
             editor.close_left_panel();
             editor.load_file(&path);
+            editor.save_cursor_to_history();
         }
     }
 
@@ -51,7 +50,7 @@ async fn main() {
     debug!("stopping red");
 }
 
-fn print_help_and_exit() {
+fn print_help() {
     let help = r#"red is a console-based text editor designed to be simple and efficient.
 
 USAGE: red [file]
@@ -91,5 +90,4 @@ KEY BINDINGS:
 For more, see readme.md or source code at https://github.com/red-rs/red.
 "#;
     println!("{}", help);
-    std::process::exit(0);
 }

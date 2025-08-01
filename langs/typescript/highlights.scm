@@ -51,7 +51,7 @@
 ((identifier) @type
  (#match? @type "^[A-Z]"))
 (type_identifier) @type
-(predefined_type) @type.builtin
+(predefined_type) @type
 
 ([
   (identifier)

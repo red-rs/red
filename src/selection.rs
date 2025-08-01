@@ -1,3 +1,4 @@
+#[derive(Debug, Clone)]
 pub struct Point {
     pub y: i32,
     pub x: i32,
@@ -27,7 +28,7 @@ impl Point {
 
 }
 
-
+#[derive(Debug, Clone)]
 pub struct Selection {
     pub start: Point,
     pub end: Point,
@@ -56,7 +57,7 @@ impl Selection {
         self.active = true;
     }
 
-    pub fn empty(&mut self) -> bool {
+    pub fn empty(&self) -> bool {
         if self.start.x == -1 || self.start.y == -1 || self.end.x == -1 || self.end.y == -1 { return true }
         let equal = self.start.equal(&self.end);
         equal
@@ -77,7 +78,7 @@ impl Selection {
         self.end.y = y as i32;
     }
 
-    pub fn contains(&mut self, y: usize, x: usize) -> bool {
+    pub fn contains(&self, y: usize, x: usize) -> bool {
         if self.empty() { return false }
 
         let p = Point {x: x as i32, y: y as i32};
@@ -91,7 +92,7 @@ impl Selection {
         result
     }
 
-    pub fn is_selected(&mut self, y: usize, x: usize) -> bool {
+    pub fn is_selected(&self, y: usize, x: usize) -> bool {
         let allowed = self.active || self.keep_once;
         let contains = self.contains(y, x);
         allowed && contains

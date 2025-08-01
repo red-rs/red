@@ -117,3 +117,59 @@ impl fmt::Debug for ScreenBuffer {
         write!(f, "] }}") // Close the `ScreenBuffer` output
     }
 }
+
+pub struct Rect {
+    /// The x coordinate of the top left corner of the `Rect`.
+    pub x: u16,
+    /// The y coordinate of the top left corner of the `Rect`.
+    pub y: u16,
+    /// The width of the `Rect`.
+    pub width: u16,
+    /// The height of the `Rect`.
+    pub height: u16,
+}
+
+
+impl Rect {
+
+    pub const fn new(x: u16, y: u16, width: u16, height: u16) -> Self {
+        let max_width = u16::MAX - x;
+        let max_height = u16::MAX - y;
+        let width = if width > max_width { max_width } else { width };
+        let height = if height > max_height {
+            max_height
+        } else {
+            height
+        };
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub const fn area(self) -> u32 {
+        (self.width as u32) * (self.height as u32)
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+
+    pub const fn left(&self) -> u16 {
+        self.x
+    }
+
+    pub const fn right(&self) -> u16 {
+        self.x.saturating_add(self.width)
+    }
+
+    pub const fn top(&self) -> u16 {
+        self.y
+    }
+
+    pub const fn bottom(&self) -> u16 {
+        self.y.saturating_add(self.height)
+    }
+}

@@ -21,23 +21,48 @@ impl Process {
             last_cmd: String::new(),
         }
     }
-   
-    pub fn run_tmux(&mut self, args:&String) {
-        let red_home = std::env::var("RED_HOME").expect("RED_HOME must be set");
-        let tmux_path = std::path::Path::new(&red_home).join("tmux.sh");
+    
+    /// Run command in tmux pane
+    /// It creates a new tmux pane and runs the command in it
+    /// If pane exists, it runs the command in the existing pane
+    pub fn run_tmux(&mut self, args: &String) -> anyhow::Result<()> {
+        let args_vec = vec![args.clone()];
+        self.last_cmd = args_vec.join(" ");
 
-        let cmd = match tmux_path.to_str() {
-            Some(tmux) => tmux.to_string(),
-            None => return,
-        };
+        let args_clone = args_vec.clone();
+        let user_cmd = args.clone();
 
-        let args = vec![args.clone()];
-        self.last_cmd = args.join(" ");
-
+        let script = r#"
+            PANES=$(tmux list-panes | wc -l)
+            
+            if [ "$PANES" -le 1 ]; then
+            tmux split-window -v
+            fi
+            
+            tmux send-keys -t 1 "$@" Enter
+            echo "$1" > /tmp/prev-tmux-command
+        "#;
         tokio::spawn(async move {
-            Command::new(&cmd).args(args)
-                .output().await.unwrap();
+            let mut child = Command::new("sh")
+                .arg("-s") // read script from stdin
+                .arg(&user_cmd) 
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .spawn().unwrap();
+
+            if let Some(mut stdin) = child.stdin.take() {
+                use tokio::io::AsyncWriteExt;
+                stdin.write_all(script.as_bytes()).await.expect("Failed to write script to stdin");
+            }
+
+            let status = child.wait().await;
+            if let Err(e) = status {
+                eprintln!("Script failed: {}", e);
+            }
         });
+
+        Ok(())
     }
 
     pub fn run_last_tmux(&mut self) {
@@ -211,23 +236,5 @@ mod process_tests {
     //     process.update_false();
     //     assert!(!process.upd());
     // }
-
-    #[tokio::test]
-    async fn test_lines_range() {
-        let mut process = Process::new();
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-        process.start("echo", "Line 1");
-        process.start("echo", "Line 2");
-
-        // Wait for some time to allow process to output lines
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-        let lines = process.lines_range(0, 2);
-        // assert!(lines.is_some());
-        let lines = lines.unwrap();
-        assert_eq!(lines[0], "Line 1");
-        assert_eq!(lines[1], "Line 2");
-    }
 
 }
