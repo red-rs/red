@@ -1084,14 +1084,16 @@ impl Editor {
             }
 
             let _ = queue!(stdout, BColor(Color::Reset), terminal::Clear(ClearType::UntilNewLine));
+            stdout.flush().expect("flush");
         }
 
-        if last_line_drawn < self.height {
+        if last_line_drawn + 1 < self.height {
             // fill empty space
-            for row in last_line_drawn+1..self.height {
+            for row in last_line_drawn..self.height {
                 if self.overlay_lines.contains(&row) { continue }
                 let _ = queue!(stdout, cursor::MoveTo(area.left(), row as u16));
                 let _ = queue!(stdout, BColor(Color::Reset), terminal::Clear(ClearType::UntilNewLine));
+                stdout.flush().expect("flush");
             }
         }
 

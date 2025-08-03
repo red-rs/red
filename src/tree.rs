@@ -34,7 +34,7 @@ impl TreeNode {
         if !Path::new(&self.fullpath).is_dir() { return Ok(()); }
 
         let mut children = Vec::new();
-       
+
         let mut directories = Vec::new();
         let mut files = Vec::new();
 
@@ -150,7 +150,7 @@ pub struct TreeView {
     root: TreeNode,
 
     selected: usize,
-    /// scroll offset 
+    /// scroll offset
     y: usize,
     moving: bool,
     /// Color for tree dir.
@@ -168,12 +168,12 @@ pub struct TreeView {
 impl TreeView {
     pub fn new(dir:String) -> Self {
         let name = if dir == "."  || dir == "./" {
-            utils::current_directory_name().unwrap() 
+            utils::current_directory_name().unwrap()
         } else { dir.to_string() };
 
         let mut root = TreeNode {
             name,
-            fullpath: utils::abs_file(&dir), 
+            fullpath: utils::abs_file(&dir),
             is_file: false,
             children: None,
 
@@ -216,8 +216,8 @@ impl TreeView {
     }
 
     pub(crate) fn handle_down(&mut self) {
-        if self.selected >= self.root.len() { 
-            return; 
+        if self.selected >= self.root.len() {
+            return;
         }
         self.selected += 1;
 
@@ -229,7 +229,7 @@ impl TreeView {
             }
         }
 
-      
+
         self.upd = true;
     }
 
@@ -284,10 +284,10 @@ impl TreeView {
 
             queue!(stdout, cursor::MoveTo(0, i as u16));
 
-            let mut col = 0; 
+            let mut col = 0;
 
-            let mut color = if node.is_file { 
-                if node.fullpath.eq(&self.active_file) { self.active_file_color } 
+            let mut color = if node.is_file {
+                if node.fullpath.eq(&self.active_file) { self.active_file_color }
                 else { self.file_color }
             } else { self.dir_color };
 
@@ -303,18 +303,22 @@ impl TreeView {
                 queue!(stdout, Print(' '));
                 col += 1;
             }
-            for ch in node.name.chars().take(self.width-padding_left-depth-1) {
+            let limit = self.width.saturating_sub(padding_left)
+                .saturating_sub(depth)
+                .saturating_sub(1);
+            
+            for ch in node.name.chars().take(limit) {
                 if col >= self.width-1 { break; }
                 queue!(stdout, FColor(color), Print(ch));
                 col += 1;
             }
-            
+
             if col < self.width {
                 for i in 0..self.width-col-1 {
                     queue!(stdout, Print(' '));
                 }
             }
-            
+
             queue!(stdout, Print(" "));
             // queue!(stdout, FColor(Color::DarkGrey), BColor(Color::Red), Print('│'));
 
@@ -374,7 +378,7 @@ impl TreeView {
         let maybe_node = Self::find_by_index(root, index + self.y, &mut count);
         maybe_node
     }
-    
+
     pub fn get_selected<'a>(&'a mut self) -> Option<&'a mut TreeNode> {
         let mut count = 0;
         let root = &mut self.root;
@@ -418,7 +422,7 @@ impl TreeView {
         }
         None
     }
-    
+
     fn find_by_index_with_depth<'a>(
         node: &'a mut TreeNode,
         index: usize,
@@ -428,7 +432,7 @@ impl TreeView {
         if *count == index {
             return Some((node, depth));
         }
-    
+
         if let Some(children) = &mut node.children {
             for child in children {
                 *count += 1;
@@ -437,15 +441,15 @@ impl TreeView {
                 }
             }
         }
-    
+
         None
     }
-    
+
     pub fn find_with_depth<'a>(&'a mut self, index: usize) -> Option<(&'a mut TreeNode, usize)> {
         let mut count = 0;
         Self::find_by_index_with_depth(&mut self.root, index + self.y, &mut count, 0)
     }
-    
+
     fn find_by_index_expand(node: &mut TreeNode, index: usize, count: &mut usize) -> bool {
         if *count == index {
             // println!("Found {}: {}", index, node.name);
@@ -507,7 +511,7 @@ impl TreeView {
         self.active_file = fullpath;
         // todo: expand all nodes
     }
-    
+
     pub async fn handle_mouse(&mut self, e: crossterm::event::MouseEvent) {
        match e {
             crossterm::event::MouseEvent { row, column, kind, modifiers } =>  {
@@ -516,7 +520,7 @@ impl TreeView {
                     crossterm::event::MouseEventKind::ScrollDown => self.scroll_down(),
                     crossterm::event::MouseEventKind::Down(button) => {}
                     _ => {}
-                        
+
                 }
             }
             _ => {}
@@ -609,10 +613,10 @@ mod tree_tests {
         println!("find 5");
         let maybe_node = tree.find(5);
         maybe_node.map(|node| node.print());
-        
+
         println!("expanding 5");
         tree.find_and_expand(5);
-    
+
         tree.print();
     }
 
@@ -627,7 +631,7 @@ mod tree_tests {
         println!("find rs");
 
         tree.filter_files_by_pattern("rs");
-    
+
         tree.print();
 
         // println!("find 16");

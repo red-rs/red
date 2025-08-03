@@ -60,7 +60,7 @@ impl Code {
             injection_queries: None,
         }
     }
-    
+
     fn detect_language(path: &str, conf: &Config) -> String {
         detect_lang::from_path(path)
             .map(|lang| lang.id().to_lowercase())
@@ -76,6 +76,7 @@ impl Code {
             "javascript" => Some(tree_sitter_javascript::LANGUAGE.into()),
             "typescript" => Some(tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
             "python" => Some(tree_sitter_python::LANGUAGE.into()),
+            "csharp" => Some(tree_sitter_c_sharp::LANGUAGE.into()),
             "go" => Some(tree_sitter_go::LANGUAGE.into()),
             "java" => Some(tree_sitter_java::LANGUAGE.into()),
             "c" => Some(tree_sitter_c::LANGUAGE.into()),
@@ -86,10 +87,12 @@ impl Code {
             "json" => Some(tree_sitter_json::LANGUAGE.into()),
             "toml" => Some(tree_sitter_toml_ng::LANGUAGE.into()),
             "shell" => Some(tree_sitter_bash::LANGUAGE.into()),
+            "markdown" => Some(tree_sitter_md::LANGUAGE.into()),
+            "markdown-inline" => Some(tree_sitter_md::INLINE_LANGUAGE.into()),
             _ => None,
         }
     }
-    
+
     fn get_highlights(lang: &str) -> anyhow::Result<String> {
         let p = format!("langs/{}/highlights.scm", lang);
         let highlights_bytes = crate::config::Asset::get(&p).ok_or_else(
@@ -98,7 +101,7 @@ impl Code {
         let highlights = std::str::from_utf8(highlights_bytes)?;
         Ok(highlights.to_string())
     }
-    
+
     fn get_test_highlights(lang: &str) -> anyhow::Result<String> {
         let p = format!("langs/{}/tests.scm", lang);
         let highlights_bytes = crate::config::Asset::get(&p).ok_or_else(
@@ -107,7 +110,7 @@ impl Code {
         let highlights = std::str::from_utf8(highlights_bytes)?;
         Ok(highlights.to_string())
     }
-    
+
     fn init_injections(query: &Query) -> anyhow::Result<(
         HashMap<String, Rc<RefCell<Parser>>>,
         HashMap<String, Query>,
@@ -118,7 +121,7 @@ impl Code {
         for name in query.capture_names() {
             if let Some(lang) = name.strip_prefix("injection.content.") {
                 if injection_parsers.contains_key(lang) {
-                    continue; 
+                    continue;
                 }
                 if let Some(language) = Self::get_language(lang) {
                     let mut parser = Parser::new();
@@ -136,34 +139,34 @@ impl Code {
 
         Ok((injection_parsers, injection_queries))
     }
-    
-    
+
+
     fn init_syntax(lang: &str, text: &Rope) -> anyhow::Result<(
-        Option<Tree>, Option<Parser>, Option<Query>, Option<Query>, 
+        Option<Tree>, Option<Parser>, Option<Query>, Option<Query>,
         Option<HashMap<String, Rc<RefCell<Parser>>>>, Option<HashMap<String, Query>>
     )> {
         let Some(language) = Self::get_language(lang) else {
             return Ok((None, None, None, None, None, None));
         };
-    
+
         let mut parser = Parser::new();
         parser.set_language(&language)?;
         let tree = parser.parse(text.to_string(), None);
-        
+
         let query = match Self::get_highlights(lang).ok() {
             Some(highlights) => Query::new(&language, &highlights).ok(),
             None => None,
         };
-        
+
         let test_query = match Self::get_test_highlights(lang).ok() {
             Some(test_highlights) => Query::new(&language, &test_highlights).ok(),
             None => None,
         };
-        
+
         let (iparsers, iqueries) = query.as_ref()
             .and_then(|q| Self::init_injections(q).ok())
             .unwrap_or_default();
-    
+
         Ok((tree, Some(parser), query, test_query, Some(iparsers), Some(iqueries)))
     }
 
@@ -172,18 +175,18 @@ impl Code {
         code.insert_text(text, 0, 0);
         code
     }
-    
+
     pub fn from_file(path: &str, conf: &Config) -> anyhow::Result<Self> {
         let file = File::open(path)?;
         let text = Rope::from_reader(BufReader::new(file))?;
         let abs_path = utils::abs_file(path);
         let file_name = utils::get_file_name(path);
-    
+
         let lang = Self::detect_language(path, conf);
         let lang_conf = conf.language.iter().find(|l| l.name == lang).cloned();
-        let (tree, parser, query, test_query, injection_parsers, injection_queries) = 
+        let (tree, parser, query, test_query, injection_parsers, injection_queries) =
             Self::init_syntax(&lang, &text)?;
-    
+
         let mut instance = Self {
             text, file_name, abs_path, lang, lang_conf,
             changed: false,
@@ -194,7 +197,7 @@ impl Code {
             r: 0, c: 0, x: 0, y: 0,
             line2runneble: HashMap::new(),
         };
-    
+
         instance.update_runnables();
         Ok(instance)
     }
@@ -595,7 +598,7 @@ impl Code {
     }
 
     /// Highlights the interval between `start` and `end` char indices.
-    /// Returns a list of (start byte, end byte, token_name) for highlighting. 
+    /// Returns a list of (start byte, end byte, token_name) for highlighting.
     pub fn highlight_interval(
         &self, start: usize, end: usize, theme: &HashMap<String, String>,
     ) -> Vec<(usize, usize, Color)> {
@@ -694,7 +697,7 @@ impl Code {
 
         results
     }
-    
+
     fn update_runnables(&mut self) {
         if self.lang_conf.is_none() {return; }
 
