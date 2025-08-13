@@ -10,12 +10,13 @@ use log2::{debug};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event,
     EventStream, KeyCode, KeyEvent, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
+    MouseButton, MouseEvent, MouseEventKind, 
+    EnableBracketedPaste, DisableBracketedPaste,
 };
 use crossterm::style::Print;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, ClearType,
-    EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen
 };
 use crossterm::{
     cursor, execute, queue,
@@ -218,6 +219,7 @@ impl Editor {
         enable_raw_mode()?;
         execute!(stdout(), cursor::Hide)?;
         execute!(stdout(), SetCursorStyle::DefaultUserShape)?;
+        execute!(stdout(), EnableBracketedPaste)?;
         stdout().flush()?;
 
         let (w, h) = terminal::size()?;
@@ -231,6 +233,7 @@ impl Editor {
         disable_raw_mode()?;
         execute!(stdout(), LeaveAlternateScreen)?;
         execute!(stdout(), DisableMouseCapture)?;
+        execute!(stdout(), DisableBracketedPaste)?;
         queue!(stdout(), cursor::Show)?;
         Ok(())
     }
@@ -391,7 +394,10 @@ impl Editor {
             }
             Event::FocusGained => {}
             Event::FocusLost => {}
-            Event::Paste(_) => {}
+            Event::Paste(s) => {
+                self.paste(s).await;
+                self.draw().await;
+            }
         }
     }
 
@@ -1521,6 +1527,12 @@ impl Editor {
             Ok(text) => text,
             Err(_) => return,
         };
+
+        self.paste(text).await;
+    }
+
+    async fn paste(&mut self, text: String) {
+        if text.is_empty() { return; }
 
         if self.selection.non_empty_and_active() {
             self.handle_cut().await;
