@@ -6,6 +6,7 @@ use std::time::Instant;
 use std::time;
 use anyhow::anyhow;
 use log2::{debug};
+use unicode_width::{UnicodeWidthStr, UnicodeWidthChar};
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event,
     EventStream, KeyCode, KeyEvent, KeyModifiers,
@@ -878,8 +879,8 @@ impl Editor {
         let mut current_col = 0;
         let mut char_idx = start_col;
 
-        for _ in visible_chars.chars() {
-            let ch_width = 1;
+        for ch in visible_chars.chars() {
+            let ch_width = ch.width().unwrap_or(1);
             if current_col + ch_width > clicked_col {
                 break;
             }
@@ -889,7 +890,7 @@ impl Editor {
 
         let line = self.code.char_slice(line_start_char, line_start_char + line_len);
 
-        let visual_width: usize = line.chars().map(|_| 1).sum();
+        let visual_width: usize = line.to_string().width();
 
         if clicked_col + self.x >= visual_width {
             let mut end_idx = line.len_chars();
@@ -1035,12 +1036,30 @@ impl Editor {
             let _ = queue!(stdout, BColor(Color::Reset), FColor(self.lncolor), Print(line_number));
 
             let line_len = self.code.line_len(line_idx);
-            let max_x = (area.width as usize).saturating_sub(line_number_width).saturating_sub(area.left() as usize);
+
+            let available_width = (area.width as usize)
+                .saturating_sub(line_number_width)
+                .saturating_sub(area.left() as usize);
 
             let start_col = self.x.min(line_len);
-            let end_col = (start_col + max_x).min(line_len);
-
+            
+            // Calculate how many characters can fit in the available width
+            let mut max_chars = 0;
+            let mut current_width = 0;
             let line_start_char = self.code.line_to_char(line_idx);
+            
+            // First pass: count how many characters fit
+            let line_chars = self.code.char_slice(line_start_char, line_start_char + line_len);
+            for ch in line_chars.chars().skip(start_col) {
+                let ch_width = ch.width().unwrap_or(1);
+                if current_width + ch_width > available_width {
+                    break;
+                }
+                current_width += ch_width;
+                max_chars += 1;
+            }
+            
+            let end_col = start_col + max_chars;
             let char_start = line_start_char + start_col;
             let char_end = line_start_char + end_col;
 
@@ -1052,14 +1071,14 @@ impl Editor {
 
             let highlights = self.cached_highlight_interval(start_byte, end_byte, &self.theme);
 
-            let mut x = 0;
+            let mut vis_x = 0; 
+            let mut char_pos = start_col; 
             let mut byte_idx_in_rope = start_byte;
 
-            for ch in displayed_line.chars().take(max_x) {
-                if x >= area.width as usize { break }
-
-                let ch_width = 1;
-                let ch_len = ch.len_utf8();
+            for ch in displayed_line.chars() {
+                let ch_width = ch.width().unwrap_or(1);
+                
+                if vis_x + ch_width > available_width { break }
 
                 let mut fcolor = Color::Reset;
                 for &(start, end, s) in &highlights {
@@ -1069,15 +1088,16 @@ impl Editor {
                     }
                 }
 
-                let bcolor = match self.selection.is_selected(line_idx, x) {
+                let bcolor = match self.selection.is_selected(line_idx, char_pos) {
                     true => self.selcolor,
                     false => Color::Reset,
                 };
 
                 let _ = queue!(stdout, FColor(fcolor), BColor(bcolor), Print(ch));
-
-                x += ch_width;
-                byte_idx_in_rope += ch_len;
+                
+                vis_x += ch_width;
+                char_pos += 1; 
+                byte_idx_in_rope += ch.len_utf8();
             }
 
             if let Some(errors) = line2error.get(&line_idx) {
@@ -1086,7 +1106,7 @@ impl Editor {
             }
 
             let _ = queue!(stdout, BColor(Color::Reset), terminal::Clear(ClearType::UntilNewLine));
-            stdout.flush().expect("flush");
+            // stdout.flush().expect("flush");
         }
 
         if last_line_drawn + 1 < self.height {
@@ -1095,7 +1115,7 @@ impl Editor {
                 if self.overlay_lines.contains(&row) { continue }
                 let _ = queue!(stdout, cursor::MoveTo(area.left(), row as u16));
                 let _ = queue!(stdout, BColor(Color::Reset), terminal::Clear(ClearType::UntilNewLine));
-                stdout.flush().expect("flush");
+                // stdout.flush().expect("flush");
             }
         }
 
@@ -1176,21 +1196,30 @@ impl Editor {
 
         let line_number_digits = self.get_line_number_width();
         let vertical_fit = (self.r >= self.y) && (self.r - self.y) < self.height;
+        // Calculate visual cursor position for horizontal fit check
+        let line_start_char = self.code.line_to_char(self.r);
+        let line_text = self.code.char_slice(line_start_char, line_start_char + self.c);
+        let visual_cursor_pos = line_text.to_string().width();
+        
         let horizontal_fit = (self.c >= self.x)
-            && (self.lp_width + line_number_digits + self.c - self.x) < self.width;
+            && (self.lp_width + line_number_digits + visual_cursor_pos - self.x) < self.width;
 
         if !vertical_fit || !horizontal_fit {
             return;
         }
 
         let out_left = self.c < self.x;
-        let out_right = self.lp_width + line_number_digits + self.c - self.x >= self.width;
+        let out_right = self.lp_width + line_number_digits + visual_cursor_pos - self.x >= self.width;
         if out_left || out_right {
             let _ = queue!(stdout(), cursor::Hide);
             return;
         }
 
-        let cursor_x_pos = self.c + self.lp_width + line_number_digits - self.x;
+        // Calculate cursor position considering Unicode character widths
+        let line_start_char = self.code.line_to_char(self.r);
+        let line_text = self.code.char_slice(line_start_char, line_start_char + self.c);
+        let visual_cursor_pos = line_text.to_string().width();
+        let cursor_x_pos = visual_cursor_pos + self.lp_width + line_number_digits - self.x;
         let cursor_y_pos = self.r - self.y;
 
         let _ = queue!(
@@ -1205,7 +1234,7 @@ impl Editor {
 
     fn draw_status(&mut self) {
         let status = self.status_line();
-        let x = self.width - status.chars().count();
+        let x = self.width - status.width();
         let y = self.height - 1;
 
         let _ = queue!(
@@ -1398,7 +1427,7 @@ impl Editor {
                     ).await;
                 }
 
-                self.c = indentation.chars().count();
+                self.c = indentation.width();
             },
             None => {},
         }
@@ -1551,7 +1580,7 @@ impl Editor {
 
         for ch in text.chars() { match ch {
             '\n' => { self.r += 1; self.c = 0; }
-            _ => self.c += 1,
+            _ => self.c += ch.width().unwrap_or(1),
         }}
 
         self.upd = true;
@@ -1583,7 +1612,7 @@ impl Editor {
 
             for ch in text.chars() { match ch {
                 '\n' => { self.r += 1; self.c = 0; }
-                _ => self.c += 1,
+                _ => self.c += ch.width().unwrap_or(1),
             }}
 
             self.selection.clean();
@@ -1736,7 +1765,7 @@ impl Editor {
         let (r,c) = (self.r, self.c);
         let inserted = self.code.insert_tab(r,c);
 
-        self.c += inserted.chars().count();
+        self.c += inserted.width();
 
         if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
             lsp.lock().await.did_change(r,c, r,c, &self.code.abs_path, &inserted).await;
@@ -1980,14 +2009,14 @@ impl Editor {
                 let sy = search_result.line;
                 let sx = search_result.column;
                 self.r = sy;
-                self.c = sx + self.search.pattern.chars().count();
+                self.c = sx + self.search.pattern.to_string().width();
                 self.focus();
                 if self.r - self.y == self.height - 1 {
                     self.y += 1;
                 }
                 self.selection.active = true;
                 self.selection.set_start(sy, sx);
-                self.selection.set_end(sy, sx + self.search.pattern.chars().count());
+                self.selection.set_end(sy, sx + self.search.pattern.to_string().width());
                 self.upd = true;
                 self.draw().await;
                 self.draw_search_line(self.search.cursor_pos, self.height - 1);
@@ -2174,7 +2203,7 @@ impl Editor {
 
         let _ = queue!(stdout(),
             cursor::MoveTo((self.lp_width + 1) as u16, (self.height-1) as u16),
-            BColor(Color::Reset), FColor(Color::Reset), Print(" ".repeat(line.chars().count())),
+            BColor(Color::Reset), FColor(Color::Reset), Print(" ".repeat(line.to_string().width())),
         );
 
         let _ = stdout().flush();
@@ -3026,7 +3055,7 @@ impl Editor {
                 self.focus();
                 self.focus_to_center();
                 self.selection.set_start(search_result.1.line-1, search_result.1.column);
-                let pattern_len = self.search.pattern.chars().count();
+                let pattern_len = self.search.pattern.to_string().width();
                 self.selection.set_end(search_result.1.line-1, search_result.1.column + pattern_len);
                 self.selection.activate();
 
