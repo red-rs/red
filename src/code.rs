@@ -1,15 +1,10 @@
 use crossterm::style::Color;
-use rayon::vec;
-use ropey::iter::Lines;
 use ropey::Rope;
 use ropey::RopeSlice;
 use tree_sitter::InputEdit;
-use std::cmp::min;
 use std::collections::HashMap;
-use std::fs;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
-use std::path::Path;
 use tree_sitter::{Language as TSLanguage,Tree, Node, Parser, Point, Query, QueryCursor, TextProvider};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -170,6 +165,7 @@ impl Code {
         Ok((tree, Some(parser), query, test_query, Some(iparsers), Some(iqueries)))
     }
 
+    #[allow(dead_code)]
     pub fn from_str(text: &str) -> Self {
         let mut code = Self::new();
         code.insert_text(text, 0, 0);
@@ -214,6 +210,7 @@ impl Code {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn set_lang(&mut self, lang:String, conf: &Config) {
         self.lang = lang;
         let lang_conf = conf.language.iter().find(|l| l.name == self.lang);
@@ -329,8 +326,8 @@ impl Code {
 
     pub fn replace_text(&mut self, row: usize, col: usize, row1: usize, col1: usize, text: &str) {
         let from = self.text.line_to_char(row) + col;
-        let to = self.text.line_to_char(row1) + col1;
-        let removed_text = self.text.slice(from..to).to_string();
+        // let to = self.text.line_to_char(row1) + col1;
+        // let removed_text = self.text.slice(from..to).to_string();
 
         self.undo_history.push(Change {
             start: from,
@@ -366,7 +363,7 @@ impl Code {
         if let Some(parser) = &mut self.parser {
             // let text = self.text.to_string();
             let rope = &self.text;
-            self.tree = parser.parse_with(&mut |byte, _| {
+            self.tree = parser.parse_with_options(&mut |byte, _| {
                 // debug!("parse_with {}", byte);
                 let sl = if byte <= rope.len_bytes() {
                     let (chunk, start, _, _) = rope.chunk_at_byte(byte);
@@ -376,12 +373,13 @@ impl Code {
                 };
                 // debug!("sl {:?}", String::from_utf8_lossy(sl));
                 sl
-            }, self.tree.as_ref());
+            }, self.tree.as_ref(), None);
 
             // self.tree = parser.parse(text, self.tree.as_ref());
         }
     }
-
+    
+    #[allow(dead_code)]
     fn set_text(&mut self, text: &str) {
         self.text = Rope::from(text);
 
@@ -409,36 +407,11 @@ impl Code {
         }
     }
 
-    pub fn get_line_at(&self, idx: usize) -> Option<RopeSlice> {
-        self.text.get_line(idx)
-    }
-
     pub fn line_at(&self, idx: usize) -> Option<&str> {
         let line = self.text.line(idx);
         line.as_str()
     }
 
-    pub fn lines_from(&self, from: usize) -> Option<Lines> {
-        self.text.get_lines_at(from)
-    }
-
-    pub fn get_from(&self, from: usize) -> Lines {
-        self.text.lines_at(from)
-    }
-
-    pub fn from_to(&self, row: usize, col: usize, row1: usize, col1: usize) -> RopeSlice {
-        let from = self.text.line_to_char(row) + col;
-        let to = self.text.line_to_char(row1) + col1;
-        self.text.slice(from..to)
-    }
-
-    pub fn slice(&self, from: usize, to: usize) -> RopeSlice {
-        let max_index = self.text.len_lines();
-        let end_index = min(to, max_index);
-        let start_index = self.text.line_to_char(from);
-        let end_index = self.text.line_to_char(end_index);
-        self.text.slice(start_index..end_index)
-    }
     pub fn char_slice(&self, start: usize, end: usize) -> RopeSlice {
         self.text.slice(start..end)
     }
@@ -447,12 +420,6 @@ impl Code {
     }
     pub fn len_lines(&self) -> usize {
         self.text.len_lines()
-    }
-    pub fn len_chars(&self) -> usize {
-        self.text.len_chars()
-    }
-    pub fn line_to_byte(&self, line: usize) -> usize {
-        self.text.line_to_byte(line)
     }
     pub fn line_to_char(&self, line_idx: usize) -> usize {
         self.text.line_to_char(line_idx)
@@ -470,6 +437,7 @@ impl Code {
         line_start + col
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.text.len_chars() == 0
     }
@@ -580,21 +548,6 @@ impl Code {
             col += 1;
         }
         true
-    }
-
-    pub fn count_tabs(&self, line_index:usize, stop_index: usize) -> Option<usize> {
-        match self.text.get_line(line_index) {
-            Some(line) => {
-                let mut count = 0;
-                for ch in line.chars().take(stop_index) {
-                    if ch == '\t' {
-                        count += 1;
-                    }
-                }
-                Some(count)
-            },
-            None => None,
-        }
     }
 
     /// Highlights the interval between `start` and `end` char indices.
@@ -733,9 +686,9 @@ impl Code {
 
                 while let Some(m) = matches.next() {
                     for capture in m.captures {
-                        let capture_index = capture.index as usize;
-                        let capture_name = &query.capture_names()[capture_index];
-                        let name = capture_name.split('.').next().unwrap_or(capture_name);
+                        // let capture_index = capture.index as usize;
+                        // let capture_name = &query.capture_names()[capture_index];
+                        // let name = capture_name.split('.').next().unwrap_or(capture_name);
                         let text = self.text.byte_slice(capture.node.start_byte()..capture.node.end_byte()).to_string();
                         let row = capture.node.start_position().row;
                         let mut vars = std::collections::HashMap::new();
@@ -887,97 +840,8 @@ impl<'a> TextProvider<&'a [u8]> for RopeProvider<'a> {
     }
 }
 
-struct SearchIter<'a> {
-    char_iter: ropey::iter::Chars<'a>,
-    search_pattern: &'a str,
-    search_pattern_char_len: usize,
-
-    // The current char index of the search head.
-    cur_index: usize,
-
-    // Tracks where we are in the search pattern for the current possible matches.
-    possible_matches: Vec<std::str::Chars<'a>>,
-}
-
-impl<'a> SearchIter<'a> {
-    fn from_rope_slice<'b>(slice: &'b RopeSlice, search_pattern: &'b str) -> SearchIter<'b> {
-        assert!(
-            !search_pattern.is_empty(),
-            "Can't search using an empty search pattern."
-        );
-        SearchIter {
-            char_iter: slice.chars(),
-            search_pattern,
-            search_pattern_char_len: search_pattern.chars().count(),
-            cur_index: 0,
-            possible_matches: Vec::new(),
-        }
-    }
-}
-
-impl<'a> Iterator for SearchIter<'a> {
-    type Item = (usize, usize);
-
-    // Return the start/end char indices of the next match.
-    fn next(&mut self) -> Option<(usize, usize)> {
-        #[allow(clippy::while_let_on_iterator)]
-        while let Some(next_char) = self.char_iter.next() {
-            self.cur_index += 1;
-
-            // Push new potential match, for a possible match starting at the
-            // current char.
-            self.possible_matches.push(self.search_pattern.chars());
-
-            // Check the rope's char against the next character in each of
-            // the potential matches, removing the potential matches that
-            // don't match.  We're using indexing instead of iteration here
-            // so that we can remove the possible matches as we go.
-            let mut i = 0;
-            while i < self.possible_matches.len() {
-                let pattern_char = self.possible_matches[i].next().unwrap();
-                if next_char == pattern_char {
-                    if self.possible_matches[i].clone().next() == None {
-                        // We have a match!  Reset possible matches and
-                        // return the successful match's char indices.
-                        let char_match_range = (
-                            self.cur_index - self.search_pattern_char_len,
-                            self.cur_index,
-                        );
-                        self.possible_matches.clear();
-                        return Some(char_match_range);
-                    } else {
-                        // Match isn't complete yet, move on to the next.
-                        i += 1;
-                    }
-                } else {
-                    // Doesn't match, remove it.
-                    let _ = self.possible_matches.swap_remove(i);
-                }
-            }
-        }
-
-        None
-    }
-}
-
-// #[cfg(test)]
-// mod code_rope_search_iterator_simple_tests {
-//     use super::SearchIter;
-
-//     #[test]
-//     fn test_search_iterator() {
-//         let rope = ropey::Rope::from_str("// This is a sample string with some occurrences of '//'.");
-//         let substring = "//";
-//         let slice = &rope.slice(0..);
-
-//         let search_iter = SearchIter::from_rope_slice(slice, substring);
-//         search_iter.for_each(|r| println!("search {:?}", r))
-//     }
-// }
-
 struct EarlyTerminationSearch<'a> {
     char_iter: ropey::iter::Chars<'a>,
-    search_pattern: &'a str,
     search_pattern_chars: Vec<char>,
     cur_index: usize, // The current char index of the search head.
     possible_match: Vec<char>, // Tracks where we are in the search pattern for the current possible match.
@@ -994,7 +858,6 @@ impl<'a> EarlyTerminationSearch<'a> {
         let search_pattern_chars: Vec<char> = search_pattern.chars().collect();
         EarlyTerminationSearch {
             char_iter: slice.chars(),
-            search_pattern,
             search_pattern_chars,
             cur_index: 0,
             possible_match: Vec::new(),
@@ -1031,126 +894,6 @@ impl<'a> Iterator for EarlyTerminationSearch<'a> {
             }
         }
         None
-    }
-}
-
-// #[cfg(test)]
-// mod code_rope_search_iterator_tests {
-//     use crate::code::{EarlyTerminationSearch};
-
-//     #[test]
-//     fn test_early_termination_search() {
-//         let rope = ropey::Rope::from_str("// This is a sample string with some occurrences of '//'.");
-//         let substring = "//";
-//         let slice = &rope.slice(0..);
-
-//         let search_iter = EarlyTerminationSearch::from_rope_slice(slice, substring);
-//         let result: Vec<(usize, usize)> = search_iter.collect();
-//         assert_eq!(result.len(), 1);
-//         assert_eq!(result.get(0).unwrap().0, 0);
-//         assert_eq!(result.get(0).unwrap().1, 2);
-//     }
-
-
-//     #[test]
-//     fn test_full_search_bench() {
-//         use std::time::{Instant};
-
-//         let n = 10000000;
-
-//         let start_time = Instant::now();
-
-//         let rope = ropey::Rope::from_str("// This is a sample string with some occurrences of '//'.");
-//         let substring = "//";
-//         let slice = &rope.slice(0..);
-
-//         for _ in 0..n {
-//             let search_iter = SearchIter::from_rope_slice(slice, substring);
-//             let result: Vec<(usize, usize)> = search_iter.collect();
-//         }
-
-//         let elapsed_time = Instant::now().duration_since(start_time).as_secs_f64();
-//         let ops_per_sec = (n as f64) / elapsed_time;
-//         println!("ops: {:.2}", ops_per_sec);
-//         // ops: 204967.29
-//     }
-
-
-//     #[test]
-//     fn test_early_termination_search_bench() {
-//         use std::time::{Instant};
-
-//         let rope = ropey::Rope::from_str("This is a sample string with some occurrences of '//'.");
-//         let substring = "//";
-//         let slice = &rope.slice(0..);
-
-//         let operation = || {
-//             let search_iter = EarlyTerminationSearch::from_rope_slice(slice, substring);
-//             let result: Vec<(usize, usize)> = search_iter.collect();
-//         };
-
-//         let n = 10_000;
-//         let start_time = Instant::now();
-//         for _ in 0..n { operation(); }
-
-//         let elapsed_time = Instant::now().duration_since(start_time).as_secs_f64();
-//         let ops_per_sec = (n as f64) / elapsed_time;
-//         println!("ops: {:.2}", ops_per_sec);
-//         // ops: 211009.97
-//     }
-// }
-
-#[cfg(test)]
-mod code_rope_search_tests {
-    use ropey::RopeSlice;
-
-    fn rope_search(rope: &RopeSlice, substring: &str) -> Option<usize> {
-        let sub_len = substring.len();
-
-        for i in 0..=rope.len_chars() - sub_len {
-            let sb = rope.slice(i..i + sub_len).as_str();
-            if sb.is_some() && sb.unwrap() == substring {
-                return Some(i);
-            }
-        }
-        None
-    }
-
-    #[test]
-    fn test_search() {
-        let rope = ropey::Rope::from_str("This is a sample string with some occurrences of '//'.");
-        let substring = "//";
-        let slice = &rope.slice(0..);
-
-        let result = rope_search(slice, substring);
-        match result {
-            Some(r) => println!("result {}", r),
-            None => println!("not found"),
-        }
-    }
-
-
-    #[test]
-    fn test_rope_search_bench() {
-        use std::time::{Instant};
-
-        let rope = ropey::Rope::from_str("This is a sample string with some occurrences of '//'.");
-        let substring = "//";
-        let slice = &rope.slice(0..);
-
-        let operation = || {
-            let result = rope_search(slice, substring);
-        };
-
-        let n = 10_000;
-        let start_time = Instant::now();
-        for _ in 0..n { operation(); }
-
-        let elapsed_time = Instant::now().duration_since(start_time).as_secs_f64();
-        let ops_per_sec = (n as f64) / elapsed_time;
-        println!("ops: {:.2}", ops_per_sec);
-        // ops: 25167.75
-        // slow
     }
 }
 
@@ -1353,10 +1096,6 @@ impl Code {
 
         return true;
     }
-
-    pub fn move_line_up(&mut self, line_idx: usize) -> bool {
-        self.move_line_down(line_idx-1)
-    }
 }
 
 #[cfg(test)]
@@ -1383,22 +1122,6 @@ mod code_move_line_test {
         println!("\n--------------------\n{}", buffer.text.to_string());
         println!("{:?}", buffer.undo_history);
         assert_eq!(buffer.text.to_string(), "hello\nworld\na");
-    }
-
-    #[test]
-    fn test_code_move_line_up() {
-        let mut buffer = Code::new();
-        buffer.insert_text("hello\nworld\na", 0, 0);
-
-        println!("{}", buffer.text.to_string());
-        println!("{:?}", buffer.undo_history);
-
-        buffer.move_line_up(1);
-
-        println!("\n--------------------\n{}", buffer.text.to_string());
-        println!("{:?}", buffer.undo_history);
-
-        assert_eq!(buffer.text.to_string(), "world\nhello\na");
     }
 
     #[test]

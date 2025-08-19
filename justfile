@@ -2,6 +2,9 @@
 default:
   @just --list
 
+run:
+    RUSTFLAGS=-Awarnings cargo run --release
+	
 build:
 	RUSTFLAGS=-Awarnings cargo build --release
 

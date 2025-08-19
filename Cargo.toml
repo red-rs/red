@@ -52,3 +52,4 @@ rust-embed = { version = "8.7.0", features = ["include-exclude"] }
 dirs = "6.0.0"
 notify = "8.0"
 unicode-width = "0.2.1"
+lsp-types = "0.97.0"

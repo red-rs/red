@@ -5,11 +5,8 @@ mod process;
 mod search;
 mod selection;
 mod tree;
-mod tests;
 mod utils;
 mod config;
-mod screen;
-
 use editor::Editor;
 
 use log2::*;

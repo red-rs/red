@@ -5,3 +5,4 @@ flamegraph.svg
 test/__pycache__
 graph.png
 test/*
+*.log

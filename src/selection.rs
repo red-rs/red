@@ -107,6 +107,7 @@ impl Selection {
         else { (self.end.y as usize, self.end.x as usize) }
     }
 
+    #[allow(dead_code)]
     pub fn swap(&mut self) {
         if self.start.greater_than(&self.end) {
             std::mem::swap(&mut self.start, &mut self.end);

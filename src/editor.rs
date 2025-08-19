@@ -6,7 +6,6 @@ use std::time::Instant;
 use std::time;
 use anyhow::anyhow;
 use log2::{debug};
-
 use crossterm::event::{
     DisableMouseCapture, EnableMouseCapture, Event,
     EventStream, KeyCode, KeyEvent, KeyModifiers,
@@ -25,13 +24,10 @@ use crossterm::{
 };
 use crossterm::cursor::{SetCursorStyle};
 use futures::{future::FutureExt, select, StreamExt};
-
 use crate::code::{Code, NodePath};
 use crate::config::Config;
 use crate::search::{Search, SearchResult};
 use crate::lsp::{self, Lsp};
-use crate::lsp::lsp_messages::{CompletionItem, Diagnostic, DiagnosticParams, ReferencesResult};
-
 use crate::process::Process;
 use crate::selection::Selection;
 use crate::utils::{CursorHistory, CursorPosition, score_matches, ClickType};
@@ -41,7 +37,7 @@ use crate::tree;
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use notify::{recommended_watcher, RecursiveMode, Watcher, event::ModifyKind};
-use crate::screen::Rect;
+use crate::utils::Rect;
 use std::cell::RefCell;
 use tokio::sync::mpsc;
 
@@ -103,8 +99,8 @@ pub struct Editor {
     lsp_status: Arc<Mutex<String>>,
 
     /// diagnostics or errors to inline display
-    diagnostics: Arc<Mutex<HashMap<String, DiagnosticParams>>>,
-    diagnostics_sender: Option<tokio::sync::mpsc::Sender<DiagnosticParams>>,
+    diagnostics: Arc<Mutex<HashMap<String, lsp_types::PublishDiagnosticsParams>>>,
+    diagnostics_sender: Option<tokio::sync::mpsc::Sender<lsp_types::PublishDiagnosticsParams>>,
 
     /// tree view
     tree_view: tree::TreeView,
@@ -289,7 +285,7 @@ impl Editor {
 
         self.draw().await;
 
-        let (diagnostic_send, mut diagnostic_rx) = mpsc::channel::<DiagnosticParams>(1);
+        let (diagnostic_send, mut diagnostic_rx) = mpsc::channel::<lsp_types::PublishDiagnosticsParams>(1);
         self.diagnostics_sender = Some(diagnostic_send.clone());
 
         self.init_new_lsp();
@@ -401,8 +397,8 @@ impl Editor {
         }
     }
 
-    async fn handle_diagnostic_update(&mut self, upd: DiagnosticParams) {
-        let filename = upd.uri.clone();
+    async fn handle_diagnostic_update(&mut self, upd: lsp_types::PublishDiagnosticsParams) {
+        let filename = upd.uri.clone().to_string();
         self.diagnostics.lock().await.insert(filename, upd);
         self.upd = true;
         self.draw().await;
@@ -418,7 +414,6 @@ impl Editor {
         }
 
         self.upd = true;
-        self.process.update_true();
         self.tree_view.set_height(self.height);
     }
 
@@ -594,7 +589,7 @@ impl Editor {
                             self.is_lp_focused = false;
                         }
                         else {
-                            node.toggle();
+                            let _ = node.toggle();
                         }
 
                         self.upd = true;
@@ -625,7 +620,7 @@ impl Editor {
                 Some(lsp) => {
                     let mut lsp = lsp.lock().await;
                     let file_content = self.code.text.to_string();
-                    lsp.did_open(&self.code.lang, &path, &file_content, false);
+                    lsp.did_open(&self.code.lang, &path, &file_content);
                 },
                 None => {
                     self.init_new_lsp();
@@ -657,7 +652,7 @@ impl Editor {
             && col < self.lp_width + 3
             && !self.code.is_runnable(line);
 
-        let on_left_panel_edge = col > 0 && col == self.lp_width.saturating_sub(1);
+        // let on_left_panel_edge = col > 0 && col == self.lp_width.saturating_sub(1);
 
         around_line_number
     }
@@ -707,7 +702,7 @@ impl Editor {
             self.draw_cursor();
             if e.kind == MouseEventKind::Up(MouseButton::Left) {
                 if let Some(runnable) = self.code.get_runnable(line) {
-                    self.process.run_tmux(&runnable.cmd);
+                    let _ = self.process.run_tmux(&runnable.cmd).await;
                 }
             }
             return;
@@ -894,7 +889,7 @@ impl Editor {
 
         let line = self.code.char_slice(line_start_char, line_start_char + line_len);
 
-        let visual_width: usize = line.chars().map(|ch| 1).sum();
+        let visual_width: usize = line.chars().map(|_| 1).sum();
 
         if clicked_col + self.x >= visual_width {
             let mut end_idx = line.len_chars();
@@ -947,7 +942,7 @@ impl Editor {
     }
 
     async fn draw(&mut self) {
-        let start = time::Instant::now();
+        // let start = time::Instant::now();
 
         if self.height < 1 { return }
 
@@ -983,6 +978,7 @@ impl Editor {
         self.upd = false;
     }
 
+    #[allow(dead_code)]
     fn draw_ttr(&mut self, start: time::Instant) {
         let elapsed = time::Instant::now() - start;
         let ttr = format!(" {:?} ms  {:?} ns",
@@ -1039,7 +1035,7 @@ impl Editor {
             let _ = queue!(stdout, BColor(Color::Reset), FColor(self.lncolor), Print(line_number));
 
             let line_len = self.code.line_len(line_idx);
-            let max_x = (area.width as usize).saturating_sub(line_number_width).saturating_sub(area.left() as usize);;
+            let max_x = (area.width as usize).saturating_sub(line_number_width).saturating_sub(area.left() as usize);
 
             let start_col = self.x.min(line_len);
             let end_col = (start_col + max_x).min(line_len);
@@ -1109,7 +1105,7 @@ impl Editor {
         &self,
         start_row: usize,
         end_row: usize,
-    ) -> HashMap<usize, Vec<Diagnostic>> {
+    ) -> HashMap<usize, Vec<lsp_types::Diagnostic>> {
         let uri = format!("file://{}", self.code.abs_path);
         let diagnostics = self.diagnostics.clone();
         let maybe_diagnostics = diagnostics.try_lock().unwrap();
@@ -1135,7 +1131,7 @@ impl Editor {
         }
     }
 
-    fn draw_error(&self, error_messages: &[Diagnostic], x: usize, y: usize) {
+    fn draw_error(&self, error_messages: &[lsp_types::Diagnostic], x: usize, y: usize) {
         let space = 5;
         let prefix = " ".repeat(space);
 
@@ -1157,8 +1153,11 @@ impl Editor {
             let full_msg = format!("{prefix}{m}");
 
             let color = match msg.severity {
-                1 => Color::Red,
-                _ => Color::Blue,
+                Some(lsp_types::DiagnosticSeverity::ERROR) => Color::Red,
+                Some(lsp_types::DiagnosticSeverity::WARNING) => Color::Yellow,
+                Some(lsp_types::DiagnosticSeverity::INFORMATION) => Color::Cyan,
+                Some(lsp_types::DiagnosticSeverity::HINT) => Color::Green,
+                _ => Color::Reset,
             };
 
             let _ = queue!(
@@ -1232,8 +1231,8 @@ impl Editor {
         let logo = r#"🅡 🅔 🅓"#;
         // let logo = "RED";
 
-        let lines:Vec<&str> = logo.split("\n").collect();
-        let logo_width = lines.get(0).unwrap().len();
+        let lines:Vec<&str> = logo.split('\n').collect();
+        // let logo_width = lines.get(0).unwrap().len();
 
         let fromy = self.height / 2 - lines.len() / 2;
         let fromx = self.lp_width + (self.width - self.lp_width)/ 2;
@@ -2161,7 +2160,7 @@ impl Editor {
             cursor::MoveTo((self.lp_width + prefix.len() + x) as u16, y as u16),
         );
 
-        stdout().flush();
+        let _ = stdout().flush();
     }
 
     pub fn clean_search_line(&mut self) {
@@ -2178,7 +2177,7 @@ impl Editor {
             BColor(Color::Reset), FColor(Color::Reset), Print(" ".repeat(line.chars().count())),
         );
 
-        stdout().flush();
+        let _ = stdout().flush();
     }
 
     pub fn init_new_lsp(&mut self) {
@@ -2220,7 +2219,7 @@ impl Editor {
             let dir = utils::current_dir();
             lsp.init(&dir).await;
 
-            lsp.did_open(&lang, &abs_file, &file_content, false);
+            lsp.did_open(&lang, &abs_file, &file_content);
         });
     }
 
@@ -2231,7 +2230,7 @@ impl Editor {
             Some(lsp) => {
                 let mut lsp = lsp.lock().await;
                 let file_content = self.code.text.to_string();
-                lsp.did_open(&self.code.lang, &self.code.abs_path, &file_content, true);
+                lsp.did_open(&self.code.lang, &self.code.abs_path, &file_content);
             },
             None => {},
         }
@@ -2249,9 +2248,8 @@ impl Editor {
     }
 
     pub async fn completion(&mut self) {
-        let mut end = false;
 
-        while !end {
+        loop {
             let mut changed = false;
 
             let path = &self.code.abs_path;
@@ -2263,10 +2261,10 @@ impl Editor {
             };
 
             let mut completion_result = match completion_result {
-                Some(c) => c, None => return,
+                Ok(c) => c, Err(_) => return,
             };
 
-            if completion_result.items.is_empty() { return; }
+            if completion_result.is_empty() { return; }
 
             self.set_lsp_status("lsp completion").await;
 
@@ -2281,7 +2279,7 @@ impl Editor {
             let prev_word = line.chars().skip(prev).take(self.c - prev).collect::<String>();
 
             // Sort completion items by matches score
-            completion_result.items.sort_by(|a, b| {
+            completion_result.sort_by(|a, b| {
                 let sa = score_matches(&a.label, &prev_word);
                 let sb = score_matches(&b.label, &prev_word);
                 let r = sb.cmp(&sa);
@@ -2290,7 +2288,7 @@ impl Editor {
                 } else { r }
             });
 
-            let options = &completion_result.items;
+            let options = &completion_result;
 
             while !changed {
                 // calculate scrolling offsets
@@ -2321,7 +2319,7 @@ impl Editor {
                                 }
                                 if event == Event::Key(KeyCode::Enter.into())
                                     || event == Event::Key(KeyCode::Tab.into()) {
-                                    let item = completion_result.items.get(selected).unwrap();
+                                    let item = completion_result.get(selected).unwrap();
                                     self.lsp_completion_apply(item).await;
                                     return;
                                 }
@@ -2372,25 +2370,25 @@ impl Editor {
     }
 
     pub fn draw_completion(
-        &mut self, height: usize, options: &Vec<CompletionItem>, selected: usize, offset: usize,
+        &mut self, height: usize, options: &Vec<lsp_types::CompletionItem>, selected: usize, offset: usize,
     ) {
-        let MAX_HEIGHT: usize = options.len().min(height);
-        let MAX_WIDTH: usize = 30;
+        let max_height: usize = options.len().min(height);
+        let max_width: usize = 30;
 
         let ln_width = self.get_line_number_width();
         let word_offset = self.code.offset(self.r, self.c);
         let (word_start, _) = self.code.word_boundaries(word_offset);
-        let (word_start_row, word_start_col) = self.code.point(word_start);
+        let (_, word_start_col) = self.code.point(word_start);
 
-        let max_label_width = options.iter().map(|o| o.label.len()).max().unwrap_or(MAX_WIDTH);
+        let max_label_width = options.iter().map(|o| o.label.len()).max().unwrap_or(max_width);
 
         let cursor_screen_row = self.r - self.y;
         let available_below = self.height.saturating_sub(cursor_screen_row + 1);
 
-        let visible_height = options.len().min(MAX_HEIGHT);
+        let visible_height = options.len().min(max_height);
 
-        let draw_above = available_below < MAX_HEIGHT
-            && cursor_screen_row >= MAX_HEIGHT;
+        let draw_above = available_below < max_height
+            && cursor_screen_row >= max_height;
 
         let from_y = if draw_above {
             cursor_screen_row.saturating_sub(visible_height)
@@ -2432,9 +2430,9 @@ impl Editor {
     }
 
     pub async fn lsp_completion_apply(
-        &mut self, item: &lsp::lsp_messages::CompletionItem
+        &mut self, item: &lsp_types::CompletionItem
     ) {
-        if item.textEdit.is_none() && item.label.is_empty() { return; }
+        if item.text_edit.is_none() && item.label.is_empty() { return; }
 
         let line = match self.code.line_at(self.r) {
             Some(line) => line, None => return,
@@ -2443,8 +2441,10 @@ impl Editor {
         let prev = utils::find_prev_word(line, self.c);
         let next = utils::find_next_word(line, self.c);
 
-        let insert_text = match item.textEdit.as_ref() {
-            Some(t) => &t.newText, None => &item.label,
+        let insert_text = match item.text_edit.as_ref() {
+            Some(lsp_types::CompletionTextEdit::InsertAndReplace(t)) => &t.new_text,
+            Some(lsp_types::CompletionTextEdit::Edit(t)) => &t.new_text,
+            _ => &item.label,
         };
 
         self.code.remove_text(self.r, prev, self.r, next);
@@ -2474,14 +2474,14 @@ impl Editor {
         };
 
         let definition = match &definition_result {
-            Some(def) if def.len() == 1 => &def[0],
+            Ok(def) if def.len() == 1 => &def[0],
             _ => return,
         };
 
         self.save_cursor_to_history();
 
-        if definition.uri != format!("file://{}", self.code.abs_path) {
-            let path = definition.uri.split("file://").nth(1).unwrap().to_string();
+        if definition.uri.to_string() != format!("file://{}", self.code.abs_path) {
+            let path = definition.uri.to_string().split("file://").nth(1).unwrap().to_string();
             self.open_file(&path).await;
         }
 
@@ -2519,7 +2519,7 @@ impl Editor {
             let elapsed = start.elapsed().as_millis();
 
             let references = match references_result {
-                Some(refr) if !refr.is_empty() => refr,
+                Ok(refr) if !refr.is_empty() => refr,
                 _ => return,
             };
 
@@ -2528,7 +2528,7 @@ impl Editor {
 
             let max_visible = 3;
             let (mut selected, mut selected_offset) = (0, 0);
-            let (height, mut width) = (max_visible, 30);
+            let (height, width) = (max_visible, 30);
             self.upd = true; self.tree_view.upd = true;
 
             self.overlay_lines.clear();
@@ -2542,8 +2542,8 @@ impl Editor {
 
                 let reference = references.get(selected).unwrap();
 
-                if reference.uri != format!("file://{}", &self.code.abs_path) {
-                    let path = reference.uri.split("file://").nth(1).unwrap().to_string();
+                if reference.uri.to_string() != format!("file://{}", &self.code.abs_path) {
+                    let path = reference.uri.to_string().split("file://").nth(1).unwrap().to_string();
                     self.open_file(&path).await;
                 }
 
@@ -2608,10 +2608,10 @@ impl Editor {
         }
     }
 
-    async fn apply_reference(&mut self, reference: &ReferencesResult) {
+    async fn apply_reference(&mut self, reference: &lsp_types::Location) {
         self.save_cursor_to_history();
-        if reference.uri != format!("file://{}", self.code.abs_path) {
-            let path = reference.uri.split("file://").nth(1).unwrap().to_string();
+        if reference.uri.to_string() != format!("file://{}", self.code.abs_path) {
+            let path = reference.uri.to_string().split("file://").nth(1).unwrap().to_string();
             self.open_file(&path).await;
         }
         self.r = reference.range.start.line as usize;
@@ -2625,12 +2625,12 @@ impl Editor {
     pub fn draw_references(
         &mut self,
         height: usize, width:usize, fromy:usize,
-        options: &Vec<ReferencesResult>,
+        options: &Vec<lsp_types::Location>,
         selected: usize, offset: usize, elapsed:u128
     ) {
         let options: Vec<String> = options.iter().enumerate().map(|(i, reff)| {
             format!(
-                "{}/{} {}:{} {}", i+1, options.len(), reff.uri.strip_prefix("file://").unwrap(),
+                "{}/{} {}:{} {}", i+1, options.len(), reff.uri.to_string().split("file://").nth(1).unwrap(),
                     reff.range.start.line, reff.range.start.character,
                 )
         }).collect();
@@ -2672,14 +2672,13 @@ impl Editor {
         };
 
         let hover_result = match maybe_hover_result {
-            Some(hr) => hr,
-            None => return,
+            Ok(hr) => hr, _ => return,
         };
 
         self.set_lsp_status("lsp completion").await;
 
-        let (mut end, mut selected, mut selected_offset) = (false, 0, 0);
-        let (height, mut width) = (10, 30);
+        let (end, mut selected, mut selected_offset) = (false, 0, 0);
+        let height = 10;
 
         let mut reader = EventStream::new();
 
@@ -2688,7 +2687,28 @@ impl Editor {
             if selected < selected_offset { selected_offset = selected }
             if selected >= selected_offset + height { selected_offset = selected - height + 1 }
 
-            let options:Vec<String> = hover_result.contents.value.split("\n").map(|s| s.to_string()).collect();
+            // The original code tried to split hover_result.contents directly, which is an enum, not a string.
+            // Instead, we first extract the string value(s) from hover_result.contents, then split into lines.
+
+            let value: String = match &hover_result.contents {
+                lsp_types::HoverContents::Scalar(marked_string) => {
+                    match marked_string {
+                        lsp_types::MarkedString::String(s) => s.clone(),
+                        lsp_types::MarkedString::LanguageString(ls) => ls.value.clone(),
+                    }
+                },
+                lsp_types::HoverContents::Array(marked_strings) => {
+                    marked_strings.iter().map(|marked_string| {
+                        match marked_string {
+                            lsp_types::MarkedString::String(s) => s.clone(),
+                            lsp_types::MarkedString::LanguageString(ls) => ls.value.clone(),
+                        }
+                    }).collect::<Vec<String>>().join("\n")
+                },
+                lsp_types::HoverContents::Markup(markup_content) => markup_content.value.clone(),
+            };
+
+            let options: Vec<String> = value.lines().map(|s| s.to_string()).collect();
 
             if options.is_empty() { return }
 
@@ -2739,23 +2759,23 @@ impl Editor {
         selected: usize,
         offset: usize,
     ) {
-        let MAX_HEIGHT: usize = options.len().min(height);
-        let MAX_WIDTH: usize = 80;
+        let max_height: usize = options.len().min(height);
+        let max_width: usize = 80;
 
         let ln_width = self.get_line_number_width();
         let word_offset = self.code.offset(self.r, self.c);
         let (word_start, _) = self.code.word_boundaries(word_offset);
-        let (word_start_row, word_start_col) = self.code.point(word_start);
+        let (_, word_start_col) = self.code.point(word_start);
 
-        let max_label_width = options.iter().map(|s| s.len()).max().unwrap_or(MAX_WIDTH);
+        let max_label_width = options.iter().map(|s| s.len()).max().unwrap_or(max_width);
 
         let cursor_screen_row = self.r - self.y;
         let available_below = self.height.saturating_sub(cursor_screen_row + 1);
 
-        let visible_height = options.len().min(MAX_HEIGHT);
+        let visible_height = options.len().min(max_height);
 
-        let draw_above = available_below < MAX_HEIGHT
-            && cursor_screen_row >= MAX_HEIGHT;
+        let draw_above = available_below < max_height
+            && cursor_screen_row >= max_height;
 
         let from_y = if draw_above {
             cursor_screen_row.saturating_sub(visible_height)
@@ -2808,12 +2828,12 @@ impl Editor {
 
         let uri = format!("file://{}", self.code.abs_path);
 
-        let diagnostics:Vec<Diagnostic> = {
+        let diagnostics: Vec<lsp_types::Diagnostic> = {
             let diagnostics = self.diagnostics.clone();
             let maybe_diagnostics = diagnostics.lock().await;
             let maybe_diagnostics = maybe_diagnostics.get(&uri);
 
-            let diagnostics:Vec<Diagnostic> = match maybe_diagnostics {
+            let diagnostics: Vec<lsp_types::Diagnostic> = match maybe_diagnostics {
                 Some(d) => d.diagnostics.iter()
                     // .filter(|d| d.severity == 1)
                     .map(|d|d.clone()).collect(),
@@ -2912,8 +2932,8 @@ impl Editor {
 
     pub fn draw_errors(
         &mut self,
-        height: usize, width: usize, fromy: usize,
-        options: &Vec<Diagnostic>,
+        height: usize, _width: usize, fromy: usize,
+        options: &Vec<lsp_types::Diagnostic>,
         selected: usize, offset: usize
     ) {
         let limit = self.width - self.lp_width - 1;

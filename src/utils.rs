@@ -12,14 +12,6 @@ pub fn hex_to_color(hex_color: &str) -> Color {
     Color::Rgb { r, g, b }
 }
 
-pub fn hex_to_rgb(hex_color: &str) -> (u8, u8, u8) {
-    let hex = hex_color.trim_start_matches('#');
-    let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
-    let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
-    let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
-    (r, g, b)
-}
-
 pub fn yaml_to_map(yaml: Value) -> HashMap<String, String> {
     yaml.as_mapping()
         .map(|mapping| {
@@ -96,10 +88,6 @@ pub fn find_prev_word(line: &str, from: usize) -> usize {
         }
     }
     0
-}
-
-pub fn pad_left(str: &str, length: usize) -> String {
-    format!("{:1$}", str, length)
 }
 
 pub const IGNORE_DIRS: &[&str] = &[
@@ -227,19 +215,6 @@ impl CursorHistory {
 }
 
 
-struct Cell {
-    character: char,
-    fg_color: crossterm::style::Color,
-    bg_color: crossterm::style::Color,
-}
-
-struct ScreenBuffer {
-    width: usize,
-    height: usize,
-    cells: Vec<Vec<Cell>>,
-}
-
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickType {
     Single,
@@ -278,3 +253,52 @@ impl ClickType {
     }
 }
 
+
+pub struct Rect {
+    /// The x coordinate of the top left corner of the `Rect`.
+    pub x: u16,
+    /// The y coordinate of the top left corner of the `Rect`.
+    pub y: u16,
+    /// The width of the `Rect`.
+    pub width: u16,
+    /// The height of the `Rect`.
+    pub height: u16,
+}
+
+
+impl Rect {
+
+    pub const fn new(x: u16, y: u16, width: u16, height: u16) -> Self {
+        let max_width = u16::MAX - x;
+        let max_height = u16::MAX - y;
+        let width = if width > max_width { max_width } else { width };
+        let height = if height > max_height {
+            max_height
+        } else {
+            height
+        };
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    pub const fn left(&self) -> u16 {
+        self.x
+    }
+
+    #[allow(dead_code)]
+    pub const fn right(&self) -> u16 {
+        self.x.saturating_add(self.width)
+    }
+
+    pub const fn top(&self) -> u16 {
+        self.y
+    }
+
+    pub const fn bottom(&self) -> u16 {
+        self.y.saturating_add(self.height)
+    }
+}

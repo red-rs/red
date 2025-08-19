@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Result;
-use serde_json::{json, Value};
+use serde_json::{Value};
 use std::collections::{HashMap, HashSet};
-use std::io::Error;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -10,20 +8,15 @@ use tokio::sync::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio::time::{self};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration};
 use tokio::io::{self};
+use log2::{info, debug, error};
 
-use self::lsp_messages::{
-    CompletionResponse, CompletionResponse2, CompletionResult, 
-    DefinitionResponse, DefinitionResult, 
-    DiagnosticParams, 
-    HoverResponse, HoverResult, 
-    ReferencesResponse, ReferencesResult
-};
+use lsp_types::*;
+use lsp_types::notification::*;
 
-use log2::*;
+use crate::config::Config;
 
 pub struct Lsp {
     lang: String,
@@ -51,26 +44,25 @@ impl Lsp {
     }
 
     pub fn start(
-        &mut self, 
-        lang: &str, 
-        cmd: &str, 
-        diagnostic_updates: Option<mpsc::Sender<DiagnosticParams>>
-    )->  io::Result<()> {
-        
+        &mut self, lang: &str, cmd: &str,
+        diagnostic_updates: Option<mpsc::Sender<PublishDiagnosticsParams>>
+    ) -> io::Result<()> {
+
         let s: Vec<&str> = cmd.split(" ").collect();
         let cmd = s[0];
         let args = &s[1..];
 
         self.lang = lang.to_string();
 
-        let (kill_send, mut kill_recv) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_send, mut kill_recv) = mpsc::channel::<()>(1);
         self.kill_send = Some(kill_send);
 
-        let (stdin_send, mut stdin_recv) = tokio::sync::mpsc::channel::<String>(1);
+        let (stdin_send, mut stdin_recv) = mpsc::channel::<String>(1);
         self.stdin_send = Some(stdin_send);
 
         // spawn lsp process
         let mut child = Command::new(cmd)
+            
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -78,16 +70,16 @@ impl Lsp {
             .spawn()?;
 
         let mut stdin = child.stdin.take().unwrap();
-        let mut stdout = child.stdout.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
 
         // reading from channel and write to child stdin
         tokio::spawn(async move {
             while let Some(m) = stdin_recv.recv().await {
-                debug!("-> {}", m);
+                info!("-> {}", m);
                 let header = format!("Content-Length: {}\r\n\r\n", m.len());
-                stdin.write_all(header.as_bytes()).await;
-                stdin.write_all(m.as_bytes()).await;
-                stdin.flush().await;
+                let _ = stdin.write_all(header.as_bytes()).await;
+                let _ = stdin.write_all(m.as_bytes()).await;
+                let _ = stdin.flush().await;
             }
         });
 
@@ -117,45 +109,35 @@ impl Lsp {
 
                 let content_length: usize = size.unwrap();
                 let mut content = vec![0; content_length];
-                reader.read_exact(&mut content).await;
+                let _ = reader.read_exact(&mut content).await;
 
-                let msg = std::str::from_utf8(&content).expect("invalid utf8 from server");
+                let msg = std::str::from_utf8(&content)
+                    .expect("invalid utf8 from lsp server");
 
-                debug!("<- {}", msg);
+                info!("<- {}", msg);
 
                 let parsed_json: Value = serde_json::from_str(msg).unwrap();
 
                 if let Some(id) = parsed_json["id"].as_u64() { // response
                     let id = id as usize;
                     if let Some(sender) = pending.lock().await.get(&id) {
-                        let s = sender.clone();
-                        let msg = msg.to_string();
-                        tokio::spawn(async move {
-                            s.send(msg).await; // send to request channel
-                        });
-                    } 
+                        let _ = sender.send(msg.to_string()).await;
+                    }
+                    continue;
                 }
-                
 
-                if let Some(method) = parsed_json["method"].as_str() {   
-                    if method.eq("textDocument/publishDiagnostics") {
-                        match serde_json::from_str::<lsp_messages::DiagnosticResponse>(&msg) {
-                            Ok(d) => {
-                                match diagnostic_updates.as_ref() {
-                                    Some(diagnostic_send) => {
-                                        diagnostic_send.send(d.params).await;
-                                    },
-                                    None => {},
-                                }
-                                
-                            },
-                            Err(e) => {
-                                error!("<- {:?} ", e);
-                            },
+                match parsed_json.get("method").and_then(|v| v.as_str()) {
+                    Some("textDocument/publishDiagnostics") => { // diagnostics
+                        let v = parsed_json["params"].clone();
+                        if let Ok(params) = serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(v) {
+                            if let Some(sender) = diagnostic_updates.as_ref() {
+                                let _ = sender.send(params).await;
+                                continue;
+                            }
                         }
-                    }   
+                    }
+                    _ => {}
                 }
-                  
             }
         });
 
@@ -175,6 +157,7 @@ impl Lsp {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn stop(&mut self) {
         if let Some(kill_send) = self.kill_send.take() {
             kill_send.send(()).await.expect("Failed to send kill signal");
@@ -191,15 +174,19 @@ impl Lsp {
             });
         }
     }
+
     pub async fn add_pending(&mut self, id: usize, sender: mpsc::Sender<String>) {
         self.pending.lock().await.insert(id, sender);
     }
+
     pub async fn remove_pending(&mut self, id: usize) {
         self.pending.lock().await.remove(&id);
     }
 
-    pub async fn wait_for(&mut self, id: usize, mut rx: mpsc::Receiver<String>) -> Option<String> {
-        let timeout = time::sleep(Duration::from_secs(1));
+    pub async fn wait(
+        &mut self, timeout: usize, mut rx: mpsc::Receiver<String>
+    ) -> Option<String> {
+        let timeout = time::sleep(Duration::from_secs(timeout as u64));
         tokio::pin!(timeout);
 
         tokio::select! {
@@ -207,23 +194,74 @@ impl Lsp {
             _ = &mut timeout => None
         }
     }
-    
+
     pub async fn init(&mut self, dir: &str) {
         let id = 0;
-        let message = lsp_messages::initialize(dir);
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (tx, rx) = mpsc::channel::<String>(1);
         self.add_pending(id, tx).await;
-
+        let message = lsp_messages::initialize(dir);
         self.send_async(message);
+        self.wait(5, rx).await;
+        self.remove_pending(id).await;
+        self.initialized();
+        self.ready.store(true, Ordering::SeqCst)
+    }
 
-        let result = self.wait_for(id, rx).await;
+    pub fn send_notification<N>(&self, params: N::Params)
+    where
+        N: lsp_types::notification::Notification,
+        N::Params: Serialize,
+    {
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": N::METHOD,
+            "params": params
+        });
+
+        self.send_async(msg.to_string());
+    }
+
+    pub async fn send_request<R>(
+        &mut self, params: R::Params
+    ) -> anyhow::Result<R::Result>
+    where
+        R: lsp_types::request::Request,
+        R::Params: Serialize,
+        R::Result: for<'de> serde::Deserialize<'de>,
+    {
+        if !self.is_ready() {
+            return Err(anyhow::anyhow!("LSP not ready"));
+        }
+
+        let id = self.get_next_id();
+
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0", "id": id,
+            "method": R::METHOD,
+            "params": serde_json::to_value(params)?,
+        });
+
+        let (tx, rx) = mpsc::channel::<String>(1);
+        self.add_pending(id, tx).await;
+        self.send_async(msg.to_string());
+        let response = self.wait(3, rx).await;
         self.remove_pending(id).await;
 
-        self.initialized();
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        
-        self.ready.store(true, Ordering::SeqCst)
+        let response_str = response.ok_or_else(||
+            anyhow::anyhow!("no response for request {}", R::METHOD))?;
+
+        let raw: lsp_messages::LspRawResponse = serde_json::from_str(&response_str)?;
+
+        if let Some(err) = raw.error {
+            return Err(anyhow::anyhow!("LSP error: {}", err));
+        }
+
+        let result_value = raw.result.ok_or_else(||
+            anyhow::anyhow!("missing result field"))?;
+
+        let parsed = serde_json::from_value::<R::Result>(result_value)?;
+
+        Ok(parsed)
     }
 
     pub fn is_ready(&mut self) -> bool {
@@ -231,680 +269,386 @@ impl Lsp {
     }
 
     pub fn initialized(&mut self) {
-        let message = lsp_messages::initialized();
-        self.send_async(message);
+        let params = InitializedParams {};
+        self.send_notification::<Initialized>(params);
     }
 
-    pub fn did_open(&mut self, lang: &str, path: &str, text: &str, force: bool) {
-        if self.opened.contains(path) && !force { return; }
-
+    pub fn did_open(&mut self, lang: &str, path: &str, text: &str) {
         self.opened.insert(path.to_string());
 
-        let message = lsp_messages::did_open(lang, path, text);
-        self.send_async(message);
+        let params = DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: format!("file://{}", path).parse().unwrap(),
+                language_id: lang.to_string(),
+                version: 0,
+                text: text.to_string(),
+            },
+        };
+        self.send_notification::<DidOpenTextDocument>(params);
     }
 
-    fn get_next_version(&mut self, path: &str) -> usize { 
+    #[allow(dead_code)]
+    pub fn did_close(&mut self, path: &str) {
+        if !self.opened.remove(path) {
+            return;
+        }
+        let params = DidCloseTextDocumentParams {
+            text_document: TextDocumentIdentifier {
+                uri: format!("file://{}", path).parse().unwrap()
+            },
+        };
+        self.send_notification::<DidCloseTextDocument>(params);
+    }
+
+    fn get_next_version(&mut self, path: &str) -> usize {
         let version = self.versions.entry(path.to_string())
             .or_insert_with(|| AtomicUsize::new(0));
-        
+
         version.fetch_add(1, Ordering::SeqCst)
     }
 
-    fn get_next_id(&mut self, ) -> usize { 
+    fn get_next_id(&mut self, ) -> usize {
         self.next_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    pub async fn did_change(&mut self,
-        line: usize,character: usize,
-        line_end: usize,character_end: usize,
+    pub async fn did_change(
+        &mut self,
+        start_line: usize, start_column: usize,
+        end_line: usize, end_column: usize,
         path: &str, text: &str,
-    ) { 
-        if !self.is_ready() { return; }
+    ) {
+        let params = DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: format!("file://{}", path).parse().unwrap(),
+                version: self.get_next_version(path) as i32,
+            },
+            content_changes: vec![
+                TextDocumentContentChangeEvent {
+                    range: Some(Range {
+                        start: Position::new(start_line as u32, start_column as u32),
+                        end: Position::new(end_line as u32, end_column as u32),
+                    }),
+                    range_length: None,
+                    text: text.to_string(),
+                }
+            ],
+        };
 
-        let version = self.get_next_version(path);
-
-        let message = lsp_messages::did_change(
-            line, character,
-            line_end, character_end,
-            path, text, version,
-        );
-        self.send_async(message);
-    }
-    
-    pub async fn did_change_text(&mut self,
-        path: &str, text: &str,
-    ) { 
-        if !self.is_ready() { return; }
-
-        let version = self.get_next_version(path);
-
-        let message = lsp_messages::did_change_text(
-            path, text, version,
-        );
-        self.send_async(message);
+        self.send_notification::<DidChangeTextDocument>(params);
     }
 
     pub async fn completion(
         &mut self, path: &str, line: usize, character: usize
-    ) -> Option<CompletionResult> {
-        if !self.is_ready() { return None; }
+    ) -> anyhow::Result<Vec<CompletionItem>> {
 
-        let id = self.get_next_id();
-        let message = json!({
-            "id": id, "jsonrpc": "2.0", "method": "textDocument/completion",
-            "params": {
-                "textDocument": { "uri": format!("file://{}", path) },
-                "position": { "line": line, "character": character },
-                "context": { "triggerKind": 1 }
-            }
-        });
+        let params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: format!("file://{}", path).parse().unwrap(),
+                },
+                position: Position::new(line as u32, character as u32),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: Some(CompletionContext {
+                trigger_kind: CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            }),
+        };
 
-        let (tx, rx) = mpsc::channel::<String>(1);
-        self.add_pending(id, tx).await;
-        self.send_async(message.to_string());
+        let response = self
+            .send_request::<lsp_types::request::Completion>(params)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Completion returned None"))?;
 
-        let result = self.wait_for(id, rx).await;
-        self.remove_pending(id).await;
+        let items = match response {
+            lsp_types::CompletionResponse::Array(items) => items,
+            lsp_types::CompletionResponse::List(list) => list.items,
+        };
 
-        result.and_then(|message| {
-            let res = serde_json::from_str::<CompletionResponse>(&message)
-                .map_err(|e| debug!("lsp json parsing error {}", e))
-                .ok().and_then(|r| r.result);
-
-            if res.is_some() { res } 
-            else {
-                // try to parse to CompletionResponse2
-                serde_json::from_str::<CompletionResponse2>(&message)
-                    .map_err(|e| debug!("lsp json parsing error {}", e))
-                    .ok().and_then(|r| Some(CompletionResult { 
-                        isIncomplete: Some(false), items: r.result 
-                    }))
-            }
-        })
+        Ok(items)
     }
 
     pub async fn definition(
-        &mut self, path: &str, line: usize, character: usize
-    ) -> Option<Vec<DefinitionResult>> {
-        if !self.is_ready() { return None; }
+        &mut self, path: &str, line: usize, character: usize,
+    ) -> anyhow::Result<Vec<Location>> {
+        let params = lsp_types::GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: format!("file://{}", path).parse()?,
+                },
+                position: Position::new(line as u32, character as u32),
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
 
-        let id = self.get_next_id();
-        let message = json!({
-            "id": id, "jsonrpc": "2.0", "method": "textDocument/definition",
-            "params": {
-                "textDocument": { "uri": format!("file://{}", path) },
-                "position": { "line": line, "character": character },
+        let response = self
+            .send_request::<lsp_types::request::GotoDefinition>(params)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Definition returned None"))?;
+
+        let locations = match response {
+            lsp_types::GotoDefinitionResponse::Scalar(location) => vec![location],
+            lsp_types::GotoDefinitionResponse::Array(locations) => locations,
+            lsp_types::GotoDefinitionResponse::Link(links) => {
+                links.into_iter()
+                    .map(|l| Location::new(l.target_uri, l.target_range))
+                    .collect()
             }
-        });
+        };
 
-        let (tx, rx) = mpsc::channel::<String>(1);
-        self.add_pending(id, tx).await;
-        self.send_async(message.to_string());
-
-        let result = self.wait_for(id, rx).await;
-        self.remove_pending(id).await;
-
-        result.and_then(|message| {
-            serde_json::from_str::<DefinitionResponse>(&message)
-                .map_err(|e| debug!("lsp json parsing error {}", e))
-                .ok().and_then(|r| Some(r.result))
-        })
+        Ok(locations)
     }
-    
+
     pub async fn references(
-        &mut self, path: &str, line: usize, character: usize
-    ) -> Option<Vec<ReferencesResult>> {
-        if !self.is_ready() { return None; }
+        &mut self, path: &str, line: usize, character: usize,
+    ) -> anyhow::Result<Vec<Location>> {
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: format!("file://{}", path).parse()?,
+                },
+                position: Position::new(line as u32, character as u32),
+            },
+            context: ReferenceContext {
+                include_declaration: false,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
 
-        let id = self.get_next_id();
-        let message = json!({
-            "id": id, "jsonrpc": "2.0", "method": "textDocument/references",
-            "params": {
-                "textDocument": { "uri": format!("file://{}", path) },
-                "position": { "line": line, "character": character },
-                "context" : { "includeDeclaration": false }
-            }
-        });
+        let response = self
+            .send_request::<lsp_types::request::References>(params)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("References returned None"))?;
 
-        let (tx, rx) = mpsc::channel::<String>(1);
-        self.add_pending(id, tx).await;
-        self.send_async(message.to_string());
-
-        let result = self.wait_for(id, rx).await;
-        self.remove_pending(id).await;
-
-        result.and_then(|message| {
-            serde_json::from_str::<ReferencesResponse>(&message)
-                .map_err(|e| debug!("lsp json parsing error {}", e))
-                .ok().and_then(|r| Some(r.result))
-        })
+        Ok(response)
     }
-
 
     pub async fn hover(
-        &mut self, path: &str, line: usize, character: usize
-    ) -> Option<HoverResult> {
-        if !self.is_ready() { return None; }
+        &mut self, path: &str, line: usize, character: usize,
+    ) -> anyhow::Result<Hover> {
 
-        let id = self.get_next_id();
-        let message = json!({
-            "id": id, "jsonrpc": "2.0", "method": "textDocument/hover",
-            "params": {
-                "textDocument": { "uri": format!("file://{}", path) },
-                "position": { "line": line, "character": character },
-            }
-        });
-
-        let (tx, rx) = mpsc::channel::<String>(1);
-        self.add_pending(id, tx).await;
-        self.send_async(message.to_string());
-
-        let result = self.wait_for(id, rx).await;
-        self.remove_pending(id).await;
-
-        result.and_then(|message| {
-            serde_json::from_str::<HoverResponse>(&message)
-                .map_err(|e| debug!("lsp json parsing error {}", e))
-                .ok().and_then(|r| Some(r.result))
-        })
-    }
-}
-
-#[tokio::test]
-async fn test_lsp() {
-    let lang = "rust";
-    let mut lsp = Lsp::new();
-
-    lsp.start(lang, "rust-analyzer", None);
-    println!("after lsp start");
-
-    sleep(Duration::from_secs(2)).await;
-
-    let dir = "/Users/max/apps/rust/red";
-    lsp.init(dir);
-    println!("after lsp init");
-
-    sleep(Duration::from_secs(2)).await;
-
-    lsp.initialized();
-    println!("after lsp initialized");
-
-    sleep(Duration::from_secs(3)).await;
-
-    let file_name = format!("{}/src/main.rs", dir);
-    let file_content = std::fs::read_to_string(&file_name).unwrap();
-
-    lsp.did_open(lang, &file_name, &file_content, false);
-    println!("after lsp did_open");
-
-    sleep(Duration::from_secs(5)).await;
-
-    let cr = lsp.completion(&file_name, 17 - 1, 17 - 1).await;
-    println!("after lsp completion");
-
-    match cr {
-        Some(result) => {
-            for item in result.items {
-                println!("{}", item.label)
-            }
-        }
-        None => {}
-    }
-
-    sleep(Duration::from_secs(3)).await;
-
-    lsp.stop().await;
-    println!("after stop");
-
-    sleep(Duration::from_secs(3)).await;
-}
-
-#[tokio::test]
-async fn main() {
-    let (send, recv) = tokio::sync::oneshot::channel::<()>();
-    let (send2, mut recv2) = tokio::sync::mpsc::channel::<String>(1);
-    let send2_arc = Arc::new(send2).clone();
-
-    let mut child = Command::new("cat")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("command not found");
-
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = child.stdout.take().unwrap();
-
-    // sending to child stdin task
-    tokio::spawn(async move {
-        while let Some(m) = recv2.recv().await {
-            println!("sending message to child stdin {}", m);
-            stdin.write_all(m.as_bytes()).await;
-        }
-    });
-
-    // reading child stdout task
-    tokio::spawn(async move {
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
-
-        println!("reading stdout task start");
-        while let Ok(Some(line)) = lines.next_line().await {
-            println!("Received line from child: {}", line);
-        }
-        println!("reading stdout task end");
-    });
-
-    tokio::spawn(async move {
-        sleep(Duration::from_secs(3)).await;
-        send2_arc.send("hello\n".to_string()).await;
-    });
-
-    // tokio::spawn(async move {
-    //     sleep(Duration::from_secs(2)).await;
-    //     println!("sending kill");
-    //     send.send(())
-    // });
-
-    // wait for process stopped or killed
-    tokio::select! {
-        _ = child.wait() => {
-            println!("child wait done, exited");
-        }
-        _ = recv => {
-            child.kill().await.expect("kill failed");
-            println!("killed");
-        }
-    }
-}
-
-pub mod lsp_messages {
-    use serde::{Deserialize, Serialize};
-    use serde_json::Result;
-    use serde_json::{json, Value};
-
-    // todo, replace it to struct in the future
-
-    pub fn initialize(dir: &str) -> String {
-        json!({
-            "id": 0,
-            "jsonrpc": "2.0",
-            "method": "initialize",
-            "params": {
-                "rootPath": dir,
-                "rootUri": format!("file://{}", dir),
-                "processId": std::process::id(),
-                "workspaceFolders": [
-                    {
-                        "name": std::path::Path::new(dir).file_name().unwrap().to_str(),
-                        "uri": format!("file://{}", dir)
-                    }
-                ],
-                "clientInfo": {
-                    "name": "red",
-                    "version": "1.0.0"
+        let params = HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: format!("file://{}", path).parse()?,
                 },
-                "capabilities": {
-                    "textDocument": {
-                        "synchronization": {
-                            "dynamicRegistration": true,
-                        },
-                        "hover": {
-                            "contentFormat": [
-                                "plaintext",
-                            ]
-                        },
-                        "publishDiagnostics": {
-                            "relatedInformation": false,
-                            "versionSupport": false,
-                            "codeDescriptionSupport": true,
-                            "dataSupport": true
-                        },
-                        "signatureHelp": {
-                            "signatureInformation": {
-                                "documentationFormat": [
-                                    "plaintext",
-                                ]
-                            }
-                        },
-                        "completion": {
-                            "completionItem": {
-                                "resolveProvider": true,
-                                "snippetSupport": false,
-                                "insertReplaceSupport": true,
-                                "labelDetailsSupport": true,
-                                "resolveSupport": {
-                                    "properties": [
-                                        "documentation",
-                                        "detail",
-                                        "additionalTextEdits"
-                                    ]
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        })
-        .to_string()
-    }
+                position: Position::new(line as u32, character as u32),
+            },
+            work_done_progress_params: Default::default(),
+        };
 
-    pub fn initialized() -> String {
-        json!({"jsonrpc": "2.0","method": "initialized","params": {}}).to_string()
-    }
+        let response = self
+            .send_request::<lsp_types::request::HoverRequest>(params)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Hover returned None"))?;
 
-    pub fn did_change_configuration() -> String {
-        json!({
-            "jsonrpc":"2.0",
-            "method":"workspace/didChangeConfiguration",
-            "params":{
-                "settings":{"hints":{
-                    "assignVariableTypes":true,
-                    "compositeLiteralFields":true,
-                    "constantValues":true,
-                    "functionTypeParameters":true,
-                    "parameterNames":true,
-                    "rangeVariableTypes":true
-                    }
-                }
-            }
-        })
-        .to_string()
-    }
-
-    pub fn did_open(lang: &str, path: &str, text: &str) -> String {
-        json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/didOpen",
-            "params": {
-                "textDocument": {
-                    "languageId": lang,
-                    "text": text,
-                    "uri": format!("file://{}", path),
-                    "version": 0
-                }
-            }
-        })
-        .to_string()
-    }
-
-    pub fn did_change_watched_files(path: &str) -> String {
-        json!({
-            "jsonrpc": "2.0",
-            "method": "workspace/didChangeWatchedFiles",
-            "params": {
-                "changes":[
-                    { "uri":format!("file://{}", path), "type":2 }
-                    ]
-
-            }
-        })
-        .to_string()
-    }
-
-    pub fn document_link(path: &str) -> String {
-        json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/documentLink",
-            "params": {
-                "textDocument": {
-                    "uri": format!("file://{}", path),
-                }
-            }
-        })
-        .to_string()
-    }
-
-    pub fn did_change(
-        line: usize,
-        character: usize,
-        line_end: usize,
-        character_end: usize,
-        path: &str,
-        text: &str,
-        version: usize,
-    ) -> String {
-        json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/didChange",
-            "params": {
-                "contentChanges": [
-                {
-                    "range": {
-                        "start": {
-                            "line": line,
-                            "character": character
-                        },
-                        "end": {
-                            "line": line_end,
-                            "character": character_end
-                        }
-                    },
-                    "text": text
-                }
-                ],
-                "textDocument": {
-                    "uri": format!("file://{}", path),
-                    "version": version
-                }
-            }
-        })
-        .to_string()
-    }
-    
-    pub fn did_change_text(
-        path: &str,
-        text: &str,
-        version: usize,
-    ) -> String {
-        json!({
-            "jsonrpc": "2.0",
-            "method": "textDocument/didChange",
-            "params": {
-                "contentChanges": [
-                {
-                    "text": text
-                }
-                ],
-                "textDocument": {
-                    "uri": format!("file://{}", path),
-                    "version": version
-                }
-            }
-        })
-        .to_string()
-    }
-
-    pub fn completion(id: usize, path: &str, line: usize, character: usize) -> String {
-        json!({
-            "id": id, "jsonrpc": "2.0", "method": "textDocument/completion",
-            "params": {
-                "textDocument": { "uri": format!("file://{}", path) },
-                "position": { "line": line, "character": character },
-                "context": { "triggerKind": 1 }
-            }
-        })
-        .to_string()
-    }
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct CompletionResponse {
-        pub jsonrpc: String,
-        #[serde(default)]
-        pub result: Option<CompletionResult>,
-        pub id: f64,
-    }
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct CompletionResponse2 {
-        pub jsonrpc: String,
-        #[serde(default)]
-        pub result: Vec<CompletionItem>,
-        pub id: f64,
-    }
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct CompletionResult {
-        pub isIncomplete: Option<bool>,
-        pub items: Vec<CompletionItem>,
-    }
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct CompletionItem {
-        pub label: String,
-        pub kind: f64,
-        pub detail: Option<String>,
-        pub preselect: Option<bool>,
-        pub sortText: Option<String>,
-        pub insertText: Option<String>,
-        pub filterText: Option<String>,
-        pub insertTextFormat: Option<f64>,
-        pub textEdit: Option<TextEdit>,
-        pub data: Option<serde_json::Value>, 
-    }
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct TextEdit {
-        pub range: Option<Range>,
-        pub replace: Option<Range>,
-        pub insert: Option<Range>,
-        pub newText: String,
-    }
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct Range {
-        pub start: PositionResponse,
-        pub end: PositionResponse,
-    }
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct PositionResponse {
-        pub line: f64,
-        pub character: f64,
-    }
-
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct DiagnosticResponse {
-        pub jsonrpc: String,
-        pub method: String,
-        pub params: DiagnosticParams,
-    }
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct DiagnosticParams {
-        pub uri: String,
-        pub version: Option<i32>,
-        pub diagnostics: Vec<Diagnostic>,
-    }
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct Diagnostic {
-        pub range: Range,
-        pub severity: i32,
-        pub code: Option<serde_json::Value>, 
-        pub code_description: Option<CodeDescription>,
-        pub source: String,
-        pub message: String,
-    }
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct CodeDescription {
-        pub href: String,
-    }
-
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct DefinitionResponse {
-        pub jsonrpc: String,
-        pub result: Vec<DefinitionResult>,
-        pub id: f64,
-    }
-    
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct DefinitionResult {
-        pub uri: String,
-        pub range: Range,
-    }
-
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct ReferencesResponse {
-        pub jsonrpc: String,
-        pub result: Vec<ReferencesResult>,
-        pub id: f64,
-    }
-        
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct ReferencesResult {
-        pub uri: String,
-        pub range: Range,
-    }
-
-
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct HoverResponse {
-        pub jsonrpc: String,
-        pub result: HoverResult,
-        pub id: f64,
-    }
-        
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct HoverResult {
-        pub contents: Contents,
-        pub range: Range,
-    }
-    
-    #[derive(Debug, Serialize, Deserialize, Clone)]
-    pub struct Contents {
-        pub kind: String,
-        pub value: String,
+        Ok(response)
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use serde_json;
-    use tests::lsp_messages::CompletionResponse2;
 
-    #[test]
-    fn test_deserialization() {
-        // JSON input string
-        let json_str = r#"{
+    #[tokio::test]
+    #[ignore]
+    async fn test_lsp_minimal() -> anyhow::Result<()> {
+        let lang = "python";
+
+        let mut lsp = Lsp::new();
+        lsp.start(lang, "pyright-langserver --stdio", None)?;
+
+        let dir = std::env::current_dir().unwrap()
+            .to_string_lossy().into_owned();
+
+        lsp.init(&dir).await;
+
+        let content = r#"for i in range(10000): print(i)"#;
+        let file_path = "fast.py";
+
+        lsp.did_open(lang, file_path, content);
+
+        // Test completion on 'range'
+        let completions = lsp.completion(file_path, 0, 12).await?;
+        let completions_str = format!("{:?}", completions);
+        // println!("Completions: {:?}", completions_str);
+        assert!(!completions.is_empty());
+        assert!(completions_str.contains("label: \"range\""));
+
+        // Test hover on 'range'
+        let hover = lsp.hover(file_path, 0, 12).await?;
+        let hover_str = format!("{:?}", hover.contents);
+        // println!("Hover: {:?}", hover_str);
+        assert!(hover_str.contains("class range"));
+        
+        // Test definition on 'i'  
+        let definitions = lsp.definition(file_path, 0, 30).await?; 
+        let definition_str = format!("{:?}", definitions);
+        // println!("Definitions: {:?}", definition_str);
+        assert!(definition_str.contains("fast.py"));
+        assert!(definition_str.contains("Position { line: 0, character: 5 }"));
+        
+        // Test references on 'i'
+        let references = lsp.references(file_path, 0, 4).await?;
+        let references_str = format!("{:?}", references);
+        // println!("References: {:?}", references_str);
+        assert!(references_str.contains("fast.py"));
+        assert!(references_str.contains("Position { line: 0, character: 30 }"));
+
+        lsp.stop().await;
+        Ok(())
+    }
+
+}
+
+pub mod lsp_messages {
+    use super::*;
+    use serde_json::to_string;
+
+    #[allow(dead_code)]
+    #[derive(Deserialize)]
+    pub struct LspRawResponse {
+        pub jsonrpc: String,
+        pub id: Value,
+        pub result: Option<Value>,
+        pub error: Option<Value>,
+    }
+
+    pub fn initialize(dir: &str) -> String {
+        let uri: Uri = format!("file://{}", dir).parse().unwrap();
+
+        let workspace_folders = Some(vec![
+            WorkspaceFolder {
+                name: std::path::Path::new(dir)
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                uri: uri.clone(),
+            }
+        ]);
+
+        let capabilities = ClientCapabilities {
+            text_document: Some(TextDocumentClientCapabilities {
+                hover: Some(lsp_types::HoverClientCapabilities {
+                    content_format: Some(vec![lsp_types::MarkupKind::PlainText]),
+                    ..Default::default()
+                }),
+                synchronization: Some(Default::default()),
+                signature_help: Some(lsp_types::SignatureHelpClientCapabilities {
+                    signature_information: Some(lsp_types::SignatureInformationSettings {
+                        documentation_format: Some(vec![lsp_types::MarkupKind::PlainText]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                completion: Some(lsp_types::CompletionClientCapabilities {
+                    completion_item: Some(lsp_types::CompletionItemCapability {
+                        insert_replace_support: Some(true),
+                        label_details_support: Some(true),
+                        snippet_support: Some(false),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                publish_diagnostics: Some(lsp_types::PublishDiagnosticsClientCapabilities {
+                    related_information: Some(false),
+                    version_support: Some(false),
+                    code_description_support: Some(true),
+                    data_support: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let params = InitializeParams {
+            process_id: Some(std::process::id() as u32),
+            // root_path: Some(dir.to_string()),
+            // root_uri: Some(uri),
+            capabilities,
+            workspace_folders,
+            client_info: Some(ClientInfo {
+                name: "anycode".to_string(),
+                version: Some("1.0.0".to_string()),
+            }),
+            ..Default::default()
+        };
+
+        let request = serde_json::json!({
+            "id": 0,
             "jsonrpc": "2.0",
-            "id": 1,
-            "result": [
-                {
-                    "label": "echo",
-                    "kind": 3,
-                    "data": {
-                        "type": 0
-                    }
-                },
-                {
-                    "documentation": {
-                        "value": "```man\n\"echo\" invocation (bash-language-server)\n\n\n```\n```bash\necho \"${1:message}\"\n```",
-                        "kind": "markdown"
-                    },
-                    "label": "echo",
-                    "insertText": "echo \"${1:message}\"",
-                    "insertTextFormat": 2,
-                    "data": {
-                        "type": 4
-                    },
-                    "kind": 15
-                }
-            ]
-        }"#;
-
-        // Deserialize JSON into Rust structs
-        let completion_response: CompletionResponse2 = serde_json::from_str(json_str).unwrap_or_else(|e| {
-            panic!("Failed to deserialize JSON: {}", e);
+            "method": "initialize",
+            "params": params
         });
 
-        // Print the deserialized structs
-        println!("{:#?}", completion_response);
+        to_string(&request).unwrap()
+    }
+}
+
+#[allow(dead_code)]
+pub struct LspManager {
+    config: Config,
+    lang2lsp: HashMap<String,Lsp>,
+    diagnostics_sender: Option<mpsc::Sender<PublishDiagnosticsParams>>,
+}
+
+impl LspManager {
+    #[allow(dead_code)]
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            lang2lsp: HashMap::new(),
+            diagnostics_sender: None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_diagnostics_sender(&mut self, d: mpsc::Sender<PublishDiagnosticsParams>) {
+        self.diagnostics_sender = Some(d);
+    }
+
+    #[allow(dead_code)]
+    pub async fn get(&mut self, lang: &str) -> Option<&mut Lsp> {
+
+        let lang_conf = self.config.language.iter().find(|lang_conf| lang_conf.name == lang)?;
+        let cmd = lang_conf.clone().lsp?.join(" ");
+
+        if !self.lang2lsp.contains_key(lang) {
+           self.init_new(lang.to_string(), &cmd).await;
+        }
+
+        self.lang2lsp.get_mut(lang)
+    }
+
+    #[allow(dead_code)]
+    pub async fn init_new(&mut self, lang: String, lsp_cmd: &str) {
+        let mut lsp = Lsp::new();
+        let diagnostic_send = self.diagnostics_sender.as_mut().map(|s|s.clone());
+        let result = lsp.start(&lang, &lsp_cmd, diagnostic_send);
+
+        match result {
+            Ok(_) => {
+                info!("lsp process started {}", &lsp_cmd);
+            },
+            Err(e) => {
+                error!("error starting lsp process {}: {}", &lsp_cmd, e.to_string());
+                // panic!("error starting lsp process {}", e.to_string());
+                return;
+            },
+        }
+
+        let dir = std::env::current_dir().unwrap()
+            .to_string_lossy().into_owned();
+
+        lsp.init(&dir).await;
+
+        self.lang2lsp.insert(lang, lsp);
     }
 }

@@ -13,14 +13,14 @@ use rust_embed::Embed;
 pub struct Asset;
 
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub theme: String,
     pub left_panel_width: Option<usize>,
     pub language: Vec<Language>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Language {
     pub name:       String,
     pub types:      Vec<String>,
@@ -32,7 +32,7 @@ pub struct Language {
     pub exectest:   Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct IndentConfig {
     pub width: i32,
     pub unit:  String,

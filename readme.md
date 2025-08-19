@@ -15,7 +15,7 @@
 
 ### Performance
 
-`red` leverages Rust's efficiency for lightning-fast text editing, ensuring that it consumes fewer resources as possble. With optimized cursor movement, content redraw, and Tree Sitter integration for highlighting, it ensures a responsive and efficient editing experience.
+`red` leverages Rust's efficiency for blazing-fast text editing, ensuring that it consumes fewer resources as possble. With optimized cursor movement, content redraw, and Tree Sitter integration for highlighting, it ensures a responsive and efficient editing experience.
 
 ### Mouse Support
 
@@ -47,7 +47,7 @@ https://t.me/red_rs_editor
 
 Linux:
 ```bash
-curl -L https://github.com/red-rs/red/releases/latest/download/red-linux.tar.gz | tar -xz
+curl -L https://github.com/red-rs/red/releases/latest/download/red-linux.tar.gz | tar -xz --overwrite
 sudo mv red /usr/local/bin/
 sudo chmod +x /usr/local/bin/red
 red --help
@@ -55,7 +55,7 @@ red --help
 ```
 Macos:
 ```bash
-curl -L https://github.com/red-rs/red/releases/latest/download/red-universal-apple-darwin.tar.gz | tar -xz
+curl -L https://github.com/red-rs/red/releases/latest/download/red-universal-apple-darwin.tar.gz | tar -xz --overwrite
 sudo mv red /usr/local/bin/
 sudo chmod +x /usr/local/bin/red
 red --version

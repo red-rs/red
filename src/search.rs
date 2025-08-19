@@ -1,6 +1,4 @@
-use anyhow::{Result};
-use std::path::{Path, PathBuf};
-use std::{fs, time};
+use anyhow::Result;
 use rayon::prelude::*;
 use crate::utils::IGNORE_EXTS;
 
@@ -13,6 +11,7 @@ pub struct Search {
     pub cursor_pos: usize,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct SearchResult {
     pub line: usize,
