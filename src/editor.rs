@@ -1064,7 +1064,10 @@ impl Editor {
             let char_end = line_start_char + end_col;
 
             let visible_chars = self.code.char_slice(char_start, char_end);
-            let displayed_line = visible_chars.to_string().replace("\t", &" ");
+            let displayed_line: String = visible_chars.chars()
+                .map(|c| if c == '\t' { ' ' } else { c })
+                .filter(|c| !c.is_control())  // remove CR, LF and other control characters
+                .collect();
 
             let start_byte = self.code.char_to_byte(char_start);
             let end_byte = self.code.char_to_byte(char_end);
@@ -1094,7 +1097,6 @@ impl Editor {
                 };
 
                 let _ = queue!(stdout, FColor(fcolor), BColor(bcolor), Print(ch));
-                
                 vis_x += ch_width;
                 char_pos += 1; 
                 byte_idx_in_rope += ch.len_utf8();
