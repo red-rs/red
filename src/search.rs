@@ -1,6 +1,6 @@
+use crate::utils::IGNORE_EXTS;
 use anyhow::Result;
 use rayon::prelude::*;
-use crate::utils::IGNORE_EXTS;
 
 #[derive(Debug)]
 pub struct Search {
@@ -49,11 +49,12 @@ pub fn search_in_directory(
         .par_iter()
         .filter_map(|file_path| {
             let path = file_path.to_str().expect("Invalid file path");
-            let search_results = search_on_file(path, substring_to_find).ok()?;
+            let abs_path = crate::utils::abs_file(path);
+            let search_results = search_on_file(abs_path.as_str(), substring_to_find).ok()?;
 
             if !search_results.is_empty() {
                 Some(FileSearchResult {
-                    file_path: file_path.to_string_lossy().to_string(),
+                    file_path: abs_path,
                     search_results,
                 })
             } else {
@@ -61,16 +62,15 @@ pub fn search_in_directory(
             }
         })
         .collect();
-    
+
     Ok(results)
 }
 
 pub fn read_directory_recursive(
-    dir_path: &std::path::Path
+    dir_path: &std::path::Path,
 ) -> anyhow::Result<Vec<std::path::PathBuf>> {
-    
     let mut paths = Vec::new();
-    
+
     let entries = match std::fs::read_dir(dir_path) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(Vec::new()),
@@ -79,14 +79,16 @@ pub fn read_directory_recursive(
 
     // Convert entries to Vec to enable parallel processing
     let entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-    
+
     // Process entries in parallel
-    let mut sub_paths: Vec<std::path::PathBuf> = entries.par_iter()
+    let mut sub_paths: Vec<std::path::PathBuf> = entries
+        .par_iter()
         .filter_map(|entry| {
             let path = entry.path();
             let file_name = path.file_name()?.to_string_lossy().to_lowercase();
 
-            if file_name.starts_with('.') || crate::utils::IGNORE_DIRS.contains(&file_name.as_str()) {
+            if file_name.starts_with('.') || crate::utils::IGNORE_DIRS.contains(&file_name.as_str())
+            {
                 return None;
             }
 
@@ -111,9 +113,7 @@ pub fn read_directory_recursive(
     Ok(paths)
 }
 
-fn search_on_file(
-    file_path: &str, substring_to_find: &str
-) -> Result<Vec<SearchResult>> {
+fn search_on_file(file_path: &str, substring_to_find: &str) -> Result<Vec<SearchResult>> {
     use std::io::prelude::*;
 
     let file = std::fs::File::open(file_path)?;

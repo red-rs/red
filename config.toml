@@ -26,7 +26,7 @@ lsp = ["pylsp"]
 indent = { width = 4, unit = " " }
 executable = true
 exec = "python {file}"
-exectest = "python -m pytest -k {test} {file}"  
+exectest = "python -m pytest -k {test} {file}"
 
 [[language]]
 name = "javascript"
@@ -46,7 +46,7 @@ lsp = ["typescript-language-server", "--stdio"]
 indent = { width = 2, unit = " " }
 executable = true
 exec = "tsx {file}"
-# exectest = "tsx -m pytest -k {test} {file}"  
+# exectest = "tsx -m pytest -k {test} {file}"
 
 [[language]]
 name = "css"
@@ -85,6 +85,21 @@ types = ["c", "h"]
 comment = "//"
 lsp = ["clangd"]
 indent = { width = 2, unit = " " }
+
+[[language]]
+name = "kconfig"
+types = ["Kconfig", "conf", "defconfig"]
+comment = "#"
+lsp = ["kconfig-lsp"]
+indent = { width = 4, unit = " " }
+
+
+[[language]]
+name = "devicetree"
+types = ["dts", "dtsi", "overlay"]
+comment = "//"
+lsp = ["dts-lsp", "--full-scan"]
+indent = { width = 4, unit = " " }
 
 [[language]]
 name = "zig"
