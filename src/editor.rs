@@ -1,45 +1,43 @@
-use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
-use std::io::{stdout, Write};
-use std::path::Path;
-use std::time::Instant;
-use std::time;
+use crate::code::{Code, NodePath};
+use crate::config::Config;
+use crate::lsp::{self, Lsp};
+use crate::process::Process;
+use crate::search::{Search, SearchResult};
+use crate::selection::Selection;
+use crate::tree;
+use crate::utils::{ClickType, CursorHistory, CursorPosition, score_matches};
+use crate::{search::search_in_directory, utils};
 use anyhow::anyhow;
-use log2::{debug};
-use unicode_width::{UnicodeWidthStr, UnicodeWidthChar};
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind, 
-    EnableBracketedPaste, DisableBracketedPaste,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use crossterm::style::Print;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, ClearType,
-    EnterAlternateScreen, LeaveAlternateScreen
+    ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use crossterm::{
     cursor, execute, queue,
     style::{Color, SetBackgroundColor as BColor, SetForegroundColor as FColor},
     terminal,
 };
-use crossterm::cursor::{SetCursorStyle};
-use futures::{future::FutureExt, select, StreamExt};
-use crate::code::{Code, NodePath};
-use crate::config::Config;
-use crate::search::{Search, SearchResult};
-use crate::lsp::{self, Lsp};
-use crate::process::Process;
-use crate::selection::Selection;
-use crate::utils::{CursorHistory, CursorPosition, score_matches, ClickType};
-use crate::{search::{search_in_directory}, utils};
-use crate::tree;
+use futures::{StreamExt, future::FutureExt, select};
+use log2::debug;
+use std::cmp::{Ordering, min};
+use std::collections::{HashMap, HashSet};
+use std::io::{Write, stdout};
+use std::path::Path;
+use std::time;
+use std::time::Instant;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use tokio::sync::Mutex;
-use std::sync::Arc;
-use notify::{recommended_watcher, RecursiveMode, Watcher, event::ModifyKind};
 use crate::utils::Rect;
+use notify::{RecursiveMode, Watcher, event::ModifyKind, recommended_watcher};
 use std::cell::RefCell;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
 // keyword and ratatui style
@@ -48,7 +46,6 @@ type Theme = HashMap<String, String>;
 type Hightlight = (usize, usize, Color);
 // start offset, end offset
 type HightlightCache = HashMap<(usize, usize), Vec<Hightlight>>;
-
 
 /// Represents a text editor.
 pub struct Editor {
@@ -96,7 +93,7 @@ pub struct Editor {
     process: Process,
 
     /// lsp servers for a language
-    lang2lsp: HashMap<String,Arc<Mutex<Lsp>>>,
+    lang2lsp: HashMap<String, Arc<Mutex<Lsp>>>,
     lsp_status: Arc<Mutex<String>>,
 
     /// diagnostics or errors to inline display
@@ -138,7 +135,10 @@ impl Editor {
             clipboard: None,
             height: 0,
             width: 0,
-            r: 0, c: 0, x: 0, y: 0,
+            r: 0,
+            c: 0,
+            x: 0,
+            y: 0,
             lncolor: Color::Reset,
             scolor: Color::Reset,
             selcolor: Color::Reset,
@@ -175,11 +175,14 @@ impl Editor {
         match buf {
             Ok(code) => {
                 self.code = code;
-                self.r = 0; self.c = 0; self.y = 0; self.x = 0;
+                self.r = 0;
+                self.c = 0;
+                self.y = 0;
+                self.x = 0;
                 self.selection.clean();
                 self.reset_highlight_cache();
             }
-            Err(_) => {},
+            Err(_) => {}
         }
     }
 
@@ -195,8 +198,11 @@ impl Editor {
     }
 
     pub fn left_panel_toggle(&mut self) {
-        if self.lp_width > 0 { self.lp_width = 0; }
-        else { self.lp_width = self.config.left_panel_width.unwrap_or(25); }
+        if self.lp_width > 0 {
+            self.lp_width = 0;
+        } else {
+            self.lp_width = self.config.left_panel_width.unwrap_or(25);
+        }
 
         self.resize(self.width, self.height);
         self.tree_view.set_width(self.lp_width);
@@ -252,29 +258,50 @@ impl Editor {
     fn configure_theme(&mut self) {
         let theme_path = &self.config.theme;
         let theme_content = crate::config::get_file_content(theme_path).unwrap();
-        let theme_yaml = serde_yaml::from_str(&theme_content)
-            .expect("Failed to parse theme yaml file");
+        let theme_yaml =
+            serde_yaml::from_str(&theme_content).expect("Failed to parse theme yaml file");
         self.theme = utils::yaml_to_map(theme_yaml);
 
-        self.lncolor = self.theme.get("lncolor").map(|c| utils::hex_to_color(c))
+        self.lncolor = self
+            .theme
+            .get("lncolor")
+            .map(|c| utils::hex_to_color(c))
             .unwrap_or(Color::AnsiValue(247));
-        self.scolor = self.theme.get("scolor").map(|c| utils::hex_to_color(c))
+        self.scolor = self
+            .theme
+            .get("scolor")
+            .map(|c| utils::hex_to_color(c))
             .unwrap_or(Color::AnsiValue(247));
-        self.selcolor = self.theme.get("selcolor").map(|c| utils::hex_to_color(c))
+        self.selcolor = self
+            .theme
+            .get("selcolor")
+            .map(|c| utils::hex_to_color(c))
             .unwrap_or(Color::AnsiValue(247));
-        self.ecolor = self.theme.get("ecolor").map(|c| utils::hex_to_color(c))
+        self.ecolor = self
+            .theme
+            .get("ecolor")
+            .map(|c| utils::hex_to_color(c))
             .unwrap_or(Color::AnsiValue(247));
-        self.lbcolor = self.theme.get("lbcolor").map(|c| utils::hex_to_color(c))
+        self.lbcolor = self
+            .theme
+            .get("lbcolor")
+            .map(|c| utils::hex_to_color(c))
             .unwrap_or(Color::AnsiValue(87));
 
         let dircolor = self.theme.get("dircolor").map(|c| utils::hex_to_color(c));
-        self.tree_view.set_dir_color(dircolor.unwrap_or(Color::Reset));
+        self.tree_view
+            .set_dir_color(dircolor.unwrap_or(Color::Reset));
 
         let filecolor = self.theme.get("filecolor").map(|c| utils::hex_to_color(c));
-        self.tree_view.set_file_color(filecolor.unwrap_or(Color::Reset));
+        self.tree_view
+            .set_file_color(filecolor.unwrap_or(Color::Reset));
 
-        let activefilecolor = self.theme.get("activefilecolor").map(|c| utils::hex_to_color(c));
-        self.tree_view.set_active_file_color(activefilecolor.unwrap_or(Color::Reset));
+        let activefilecolor = self
+            .theme
+            .get("activefilecolor")
+            .map(|c| utils::hex_to_color(c));
+        self.tree_view
+            .set_active_file_color(activefilecolor.unwrap_or(Color::Reset));
     }
 
     pub async fn start(&mut self) {
@@ -286,7 +313,8 @@ impl Editor {
 
         self.draw().await;
 
-        let (diagnostic_send, mut diagnostic_rx) = mpsc::channel::<lsp_types::PublishDiagnosticsParams>(1);
+        let (diagnostic_send, mut diagnostic_rx) =
+            mpsc::channel::<lsp_types::PublishDiagnosticsParams>(1);
         self.diagnostics_sender = Some(diagnostic_send.clone());
 
         self.init_new_lsp();
@@ -295,7 +323,8 @@ impl Editor {
 
         let mut watcher = recommended_watcher(move |res| {
             let _ = watch_tx.blocking_send(res);
-        }).unwrap();
+        })
+        .unwrap();
 
         let p = Path::new(&self.code.abs_path);
         let _ = watcher.watch(p, RecursiveMode::Recursive);
@@ -324,14 +353,11 @@ impl Editor {
         }
     }
 
-    async fn handle_watch_event(
-        &mut self, res: Result<notify::Event, notify::Error>
-    ) {
+    async fn handle_watch_event(&mut self, res: Result<notify::Event, notify::Error>) {
         match res {
             Ok(event) => {
                 // println!("File event: {:?}", event);
                 match event.kind {
-
                     notify::EventKind::Modify(ModifyKind::Data(_)) => {
                         let selfpath = Path::new(&self.code.abs_path);
 
@@ -360,8 +386,7 @@ impl Editor {
     fn is_quit_event(&mut self, event: &Event) -> bool {
         match event {
             Event::Key(e) => {
-                if e.modifiers == KeyModifiers::CONTROL &&
-                   e.code == KeyCode::Char('q') {
+                if e.modifiers == KeyModifiers::CONTROL && e.code == KeyCode::Char('q') {
                     return true;
                 }
             }
@@ -381,9 +406,10 @@ impl Editor {
                 self.draw().await;
             }
             Event::Key(e) => {
-                #[cfg(target_os = "windows")] { // skip press event on windows
-                    if e.kind == KeyEventKind::Press {
-                        anyhow::bail!("skip press event on windows")
+                #[cfg(target_os = "windows")]
+                {
+                    if e.kind == KeyEventKind::Release {
+                        return;
                     }
                 };
                 self.handle_keyboard(e).await;
@@ -406,7 +432,9 @@ impl Editor {
     }
 
     fn resize(&mut self, w: usize, h: usize) {
-        if w == 0 || h == 0 { return; }
+        if w == 0 || h == 0 {
+            return;
+        }
         if w != self.width {
             self.width = w;
         }
@@ -424,7 +452,10 @@ impl Editor {
             return;
         }
 
-        if event.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT) {
+        if event
+            .modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        {
             if event.code == KeyCode::Up {
                 self.move_line_up().await;
             }
@@ -440,7 +471,7 @@ impl Editor {
                 match event.code {
                     KeyCode::Up => self.select_more(),
                     KeyCode::Down => self.select_less(),
-                    KeyCode::Left =>  self.handle_left_word(),
+                    KeyCode::Left => self.handle_left_word(),
                     KeyCode::Right => self.handle_right_word(),
                     KeyCode::Backspace => self.handle_cut_line().await,
                     _ => debug!("event.code {:?}", event.code),
@@ -513,8 +544,7 @@ impl Editor {
             _ => {}
         }
 
-
-        if self.selection.active || self.selection.keep_once  {
+        if self.selection.active || self.selection.keep_once {
             self.selection.clean();
             self.selection.keep_once = false;
             self.upd = true;
@@ -525,8 +555,7 @@ impl Editor {
         if self.lp_width == 0 {
             self.is_lp_focused = true;
             self.left_panel_toggle();
-        }
-        else {
+        } else {
             if !self.is_lp_focused {
                 self.is_lp_focused = true;
             } else {
@@ -550,13 +579,12 @@ impl Editor {
                 }
                 return;
             }
-            KeyModifiers::NONE => {},
-            KeyModifiers::SHIFT => {},
+            KeyModifiers::NONE => {}
+            KeyModifiers::SHIFT => {}
             _ => {
                 return;
-            },
+            }
         }
-
 
         match event.code {
             KeyCode::Up => self.tree_view.handle_up(),
@@ -568,34 +596,32 @@ impl Editor {
             }
             KeyCode::Backspace => {
                 self.tree_view.remove_filter_char();
-            },
+            }
             KeyCode::Char(c) => {
                 self.tree_view.insert_filter_char(c);
             }
-            KeyCode::Enter => {
-                match self.tree_view.get_selected() {
-                    None => {}, Some(node) => {
-                        if node.is_file() {
-                            let path = node.fullpath();
-                            self.save_cursor_to_history();
+            KeyCode::Enter => match self.tree_view.get_selected() {
+                None => {}
+                Some(node) => {
+                    if node.is_file() {
+                        let path = node.fullpath();
+                        self.save_cursor_to_history();
 
-                            if self.tree_view.is_search() {
-                                self.tree_view.clear_search();
-                                self.tree_view.expand_root();
-                                self.tree_view.set_scroll(0);
-                                self.tree_view.find_expand_by_fullpath(&path);
-                            }
-
-                            self.open_file(&path).await;
-                            self.is_lp_focused = false;
-                        }
-                        else {
-                            let _ = node.toggle();
+                        if self.tree_view.is_search() {
+                            self.tree_view.clear_search();
+                            self.tree_view.expand_root();
+                            self.tree_view.set_scroll(0);
+                            self.tree_view.find_expand_by_fullpath(&path);
                         }
 
-                        self.upd = true;
-                        self.tree_view.upd = true;
+                        self.open_file(&path).await;
+                        self.is_lp_focused = false;
+                    } else {
+                        let _ = node.toggle();
                     }
+
+                    self.upd = true;
+                    self.tree_view.upd = true;
                 }
             },
             _ => {
@@ -608,11 +634,13 @@ impl Editor {
         let is_open = self.codes.contains_key(path);
 
         if !is_open {
-            self.code.set_cursor_position(self.r, self.c, self.y, self.x);
+            self.code
+                .set_cursor_position(self.r, self.c, self.y, self.x);
 
             let current_code = std::mem::replace(&mut self.code, Code::new());
 
-            self.codes.insert(current_code.abs_path.clone(), current_code);
+            self.codes
+                .insert(current_code.abs_path.clone(), current_code);
             self.load_file(path);
 
             let lang = self.code.lang.clone();
@@ -622,10 +650,10 @@ impl Editor {
                     let mut lsp = lsp.lock().await;
                     let file_content = self.code.text.to_string();
                     lsp.did_open(&self.code.lang, &path, &file_content);
-                },
+                }
                 None => {
                     self.init_new_lsp();
-                },
+                }
             }
             if let Some(watcher) = self.watcher.as_mut() {
                 let dir = Path::new(path);
@@ -633,15 +661,21 @@ impl Editor {
             }
         } else {
             let mut code = self.codes.remove(path).unwrap();
-            let (r,c,y,x) = code.get_cursor_position();
+            let (r, c, y, x) = code.get_cursor_position();
 
             self.code.set_cursor_position(
-                self.r.clone(), self.c.clone(), self.y.clone(), self.x.clone()
+                self.r.clone(),
+                self.c.clone(),
+                self.y.clone(),
+                self.x.clone(),
             );
 
             let oldcode = std::mem::replace(&mut self.code, code);
             self.codes.insert(oldcode.abs_path.clone(), oldcode);
-            self.r = r; self.c = c; self.y = y; self.x = x;
+            self.r = r;
+            self.c = c;
+            self.y = y;
+            self.x = x;
         }
     }
 
@@ -722,8 +756,10 @@ impl Editor {
             self.handle_mouse_tree(e).await;
         } else {
             let area = Rect::new(
-                self.lp_width as u16, 0,
-                self.width as u16, self.height as u16,
+                self.lp_width as u16,
+                0,
+                self.width as u16,
+                self.height as u16,
             );
             self.handle_mouse_editor(e, &area).await;
         }
@@ -757,7 +793,9 @@ impl Editor {
                     let end = name_start + name_width as u16;
 
                     let name_clicked = e.column >= name_start && e.column < end;
-                    if !name_clicked { return; }
+                    if !name_clicked {
+                        return;
+                    }
 
                     if clicked_node.is_file() {
                         let path = clicked_node.fullpath();
@@ -778,7 +816,6 @@ impl Editor {
     }
 
     async fn handle_mouse_editor(&mut self, e: MouseEvent, area: &Rect) {
-
         // handle clicks with modifier keys first
         match (e.modifiers, e.kind) {
             (KeyModifiers::CONTROL, MouseEventKind::Down(MouseButton::Left)) => {
@@ -809,7 +846,10 @@ impl Editor {
                 if let Some(cursor) = pos {
                     let now = Instant::now();
                     let click_type = ClickType::from_click_history(
-                        now, cursor, self.last_click, self.last_last_click,
+                        now,
+                        cursor,
+                        self.last_click,
+                        self.last_last_click,
                     );
                     let (start, end) = match click_type {
                         ClickType::Triple => self.code.line_boundaries(cursor),
@@ -845,10 +885,7 @@ impl Editor {
         }
     }
 
-    fn cursor_from_mouse(
-        &self, mouse_x: u16, mouse_y: u16, area: &Rect
-    ) -> Option<usize> {
-
+    fn cursor_from_mouse(&self, mouse_x: u16, mouse_y: u16, area: &Rect) -> Option<usize> {
         let line_number_width = self.get_line_number_width() as u16;
 
         if mouse_y < area.top()
@@ -888,7 +925,9 @@ impl Editor {
             char_idx += 1;
         }
 
-        let line = self.code.char_slice(line_start_char, line_start_char + line_len);
+        let line = self
+            .code
+            .char_slice(line_start_char, line_start_char + line_len);
 
         let visual_width: usize = line.to_string().width();
 
@@ -911,8 +950,13 @@ impl Editor {
             format!("  {}", buttons)
         } else {
             let changed = if self.code.changed { "*" } else { " " };
-            format!("  {}:{} {} {}{}{}",
-                self.r + 1, self.c + 1, self.code.lang, self.code.file_name, changed,
+            format!(
+                "  {}:{} {} {}{}{}",
+                self.r + 1,
+                self.c + 1,
+                self.code.lang,
+                self.code.file_name,
+                changed,
                 buttons
             )
         }
@@ -925,7 +969,10 @@ impl Editor {
     }
 
     fn cached_highlight_interval(
-        &self, start: usize, end: usize, theme: &Theme
+        &self,
+        start: usize,
+        end: usize,
+        theme: &Theme,
     ) -> Vec<Hightlight> {
         let mut cache = self.highlights_cache.borrow_mut();
         let key = (start, end);
@@ -945,13 +992,15 @@ impl Editor {
     async fn draw(&mut self) {
         // let start = time::Instant::now();
 
-        if self.height < 1 { return }
+        if self.height < 1 {
+            return;
+        }
 
         let is_file_empty = self.code.file_name.is_empty();
 
         if is_file_empty {
             let _ = queue!(stdout(), cursor::Hide);
-            if self.tree_view.is_search(){
+            if self.tree_view.is_search() {
                 let _ = queue!(stdout(), cursor::Show);
             }
             self.tree_view.draw(is_file_empty);
@@ -966,7 +1015,9 @@ impl Editor {
         self.draw_cursor();
         self.tree_view.draw_search();
 
-        if !self.upd { return }
+        if !self.upd {
+            return;
+        }
 
         self.draw_editor();
         self.draw_status();
@@ -982,13 +1033,11 @@ impl Editor {
     #[allow(dead_code)]
     fn draw_ttr(&mut self, start: time::Instant) {
         let elapsed = time::Instant::now() - start;
-        let ttr = format!(" {:?} ms  {:?} ns",
-            elapsed.as_millis(), elapsed.as_nanos()
-        );
+        let ttr = format!(" {:?} ms  {:?} ns", elapsed.as_millis(), elapsed.as_nanos());
 
         let _ = queue!(
             stdout(),
-            cursor::MoveTo((self.width - ttr.len() -1) as u16, (self.height) as u16),
+            cursor::MoveTo((self.width - ttr.len() - 1) as u16, (self.height) as u16),
             FColor(self.lncolor),
             Print(ttr),
         );
@@ -1001,8 +1050,10 @@ impl Editor {
         let _ = queue!(stdout, cursor::Hide);
 
         let area = Rect::new(
-            (self.lp_width) as u16, 0 as u16,
-            self.width as u16, self.height as u16,
+            (self.lp_width) as u16,
+            0 as u16,
+            self.width as u16,
+            self.height as u16,
         );
 
         let total_lines = self.code.len_lines();
@@ -1015,25 +1066,41 @@ impl Editor {
 
         // draw line numbers and text
         for screen_y in 0..(area.height as usize) {
-            if self.overlay_lines.contains(&screen_y) { continue }
+            if self.overlay_lines.contains(&screen_y) {
+                continue;
+            }
 
             let line_idx = self.y + screen_y;
             last_line_drawn = screen_y;
-            if line_idx >= total_lines { break }
+            if line_idx >= total_lines {
+                break;
+            }
 
             let draw_y = area.top() + screen_y as u16;
-            if draw_y >= area.bottom() { break }
+            if draw_y >= area.bottom() {
+                break;
+            }
 
             let _ = queue!(stdout, cursor::MoveTo(area.left(), area.top() + draw_y));
 
             if self.code.is_runnable(line_idx) {
                 self.draw_run_button(screen_y, self.lbcolor);
             } else {
-                let _ = queue!(stdout, BColor(Color::Reset), FColor(Color::Reset), Print(" "));
+                let _ = queue!(
+                    stdout,
+                    BColor(Color::Reset),
+                    FColor(Color::Reset),
+                    Print(" ")
+                );
             }
 
-            let line_number = format!("{:^width$}", line_idx + 1, width = line_number_width-1);
-            let _ = queue!(stdout, BColor(Color::Reset), FColor(self.lncolor), Print(line_number));
+            let line_number = format!("{:^width$}", line_idx + 1, width = line_number_width - 1);
+            let _ = queue!(
+                stdout,
+                BColor(Color::Reset),
+                FColor(self.lncolor),
+                Print(line_number)
+            );
 
             let line_len = self.code.line_len(line_idx);
 
@@ -1042,14 +1109,16 @@ impl Editor {
                 .saturating_sub(area.left() as usize);
 
             let start_col = self.x.min(line_len);
-            
+
             // Calculate how many characters can fit in the available width
             let mut max_chars = 0;
             let mut current_width = 0;
             let line_start_char = self.code.line_to_char(line_idx);
-            
+
             // First pass: count how many characters fit
-            let line_chars = self.code.char_slice(line_start_char, line_start_char + line_len);
+            let line_chars = self
+                .code
+                .char_slice(line_start_char, line_start_char + line_len);
             for ch in line_chars.chars().skip(start_col) {
                 let ch_width = ch.width().unwrap_or(1);
                 if current_width + ch_width > available_width {
@@ -1058,15 +1127,16 @@ impl Editor {
                 current_width += ch_width;
                 max_chars += 1;
             }
-            
+
             let end_col = start_col + max_chars;
             let char_start = line_start_char + start_col;
             let char_end = line_start_char + end_col;
 
             let visible_chars = self.code.char_slice(char_start, char_end);
-            let displayed_line: String = visible_chars.chars()
+            let displayed_line: String = visible_chars
+                .chars()
                 .map(|c| if c == '\t' { ' ' } else { c })
-                .filter(|c| !c.is_control())  // remove CR, LF and other control characters
+                .filter(|c| !c.is_control()) // remove CR, LF and other control characters
                 .collect();
 
             let start_byte = self.code.char_to_byte(char_start);
@@ -1074,14 +1144,16 @@ impl Editor {
 
             let highlights = self.cached_highlight_interval(start_byte, end_byte, &self.theme);
 
-            let mut vis_x = 0; 
-            let mut char_pos = start_col; 
+            let mut vis_x = 0;
+            let mut char_pos = start_col;
             let mut byte_idx_in_rope = start_byte;
 
             for ch in displayed_line.chars() {
                 let ch_width = ch.width().unwrap_or(1);
-                
-                if vis_x + ch_width > available_width { break }
+
+                if vis_x + ch_width > available_width {
+                    break;
+                }
 
                 let mut fcolor = Color::Reset;
                 for &(start, end, s) in &highlights {
@@ -1098,7 +1170,7 @@ impl Editor {
 
                 let _ = queue!(stdout, FColor(fcolor), BColor(bcolor), Print(ch));
                 vis_x += ch_width;
-                char_pos += 1; 
+                char_pos += 1;
                 byte_idx_in_rope += ch.len_utf8();
             }
 
@@ -1107,20 +1179,29 @@ impl Editor {
                 self.draw_error(errors, x_error, screen_y);
             }
 
-            let _ = queue!(stdout, BColor(Color::Reset), terminal::Clear(ClearType::UntilNewLine));
+            let _ = queue!(
+                stdout,
+                BColor(Color::Reset),
+                terminal::Clear(ClearType::UntilNewLine)
+            );
             // stdout.flush().expect("flush");
         }
 
         if last_line_drawn + 1 < self.height {
             // fill empty space
             for row in last_line_drawn..self.height {
-                if self.overlay_lines.contains(&row) { continue }
+                if self.overlay_lines.contains(&row) {
+                    continue;
+                }
                 let _ = queue!(stdout, cursor::MoveTo(area.left(), row as u16));
-                let _ = queue!(stdout, BColor(Color::Reset), terminal::Clear(ClearType::UntilNewLine));
+                let _ = queue!(
+                    stdout,
+                    BColor(Color::Reset),
+                    terminal::Clear(ClearType::UntilNewLine)
+                );
                 // stdout.flush().expect("flush");
             }
         }
-
     }
 
     fn get_lines_errors(
@@ -1166,7 +1247,8 @@ impl Editor {
             let available_width = self.width.saturating_sub(x);
             let message_limit = available_width.saturating_sub(space);
 
-            let m: String = msg.message
+            let m: String = msg
+                .message
                 .replace('\n', " ")
                 .chars()
                 .take(message_limit)
@@ -1194,15 +1276,19 @@ impl Editor {
     }
 
     fn draw_cursor(&mut self) {
-        if self.code.file_name.is_empty() { return; }
+        if self.code.file_name.is_empty() {
+            return;
+        }
 
         let line_number_digits = self.get_line_number_width();
         let vertical_fit = (self.r >= self.y) && (self.r - self.y) < self.height;
         // Calculate visual cursor position for horizontal fit check
         let line_start_char = self.code.line_to_char(self.r);
-        let line_text = self.code.char_slice(line_start_char, line_start_char + self.c);
+        let line_text = self
+            .code
+            .char_slice(line_start_char, line_start_char + self.c);
         let visual_cursor_pos = line_text.to_string().width();
-        
+
         let horizontal_fit = (self.c >= self.x)
             && (self.lp_width + line_number_digits + visual_cursor_pos - self.x) < self.width;
 
@@ -1211,7 +1297,8 @@ impl Editor {
         }
 
         let out_left = self.c < self.x;
-        let out_right = self.lp_width + line_number_digits + visual_cursor_pos - self.x >= self.width;
+        let out_right =
+            self.lp_width + line_number_digits + visual_cursor_pos - self.x >= self.width;
         if out_left || out_right {
             let _ = queue!(stdout(), cursor::Hide);
             return;
@@ -1219,7 +1306,9 @@ impl Editor {
 
         // Calculate cursor position considering Unicode character widths
         let line_start_char = self.code.line_to_char(self.r);
-        let line_text = self.code.char_slice(line_start_char, line_start_char + self.c);
+        let line_text = self
+            .code
+            .char_slice(line_start_char, line_start_char + self.c);
         let visual_cursor_pos = line_text.to_string().width();
         let cursor_x_pos = visual_cursor_pos + self.lp_width + line_number_digits - self.x;
         let cursor_y_pos = self.r - self.y;
@@ -1250,11 +1339,15 @@ impl Editor {
 
     fn draw_run_button(&self, row: usize, color: Color) {
         let run = "▶";
-        let _ = queue!(stdout(),
-            cursor::Hide, cursor::MoveTo(self.lp_width as u16, row as u16),
-            BColor(Color::Reset), FColor(color),
+        let _ = queue!(
+            stdout(),
+            cursor::Hide,
+            cursor::MoveTo(self.lp_width as u16, row as u16),
+            BColor(Color::Reset),
+            FColor(color),
             Print(run),
-            BColor(Color::Reset), FColor(Color::Reset)
+            BColor(Color::Reset),
+            FColor(Color::Reset)
         );
     }
 
@@ -1262,26 +1355,30 @@ impl Editor {
         let logo = r#"🅡 🅔 🅓"#;
         // let logo = "RED";
 
-        let lines:Vec<&str> = logo.split('\n').collect();
+        let lines: Vec<&str> = logo.split('\n').collect();
         // let logo_width = lines.get(0).unwrap().len();
 
         let fromy = self.height / 2 - lines.len() / 2;
-        let fromx = self.lp_width + (self.width - self.lp_width)/ 2;
+        let fromx = self.lp_width + (self.width - self.lp_width) / 2;
 
         let mut stdout = stdout();
 
-        for r in 0..self.height{
-            let _ = queue!(stdout,
+        for r in 0..self.height {
+            let _ = queue!(
+                stdout,
                 cursor::MoveTo(self.lp_width as u16, r as u16),
                 terminal::Clear(ClearType::UntilNewLine)
             );
         }
 
-        for (i,line) in lines.iter().enumerate() {
-            let _ = queue!(stdout,
+        for (i, line) in lines.iter().enumerate() {
+            let _ = queue!(
+                stdout,
                 cursor::MoveTo((fromx) as u16, (fromy + i) as u16),
-                FColor(Color::Reset), Print(line)
-            ).unwrap();
+                FColor(Color::Reset),
+                Print(line)
+            )
+            .unwrap();
         }
     }
 
@@ -1390,9 +1487,11 @@ impl Editor {
 
     fn handle_right_word(&mut self) {
         let line = self.code.line_at(self.r);
-        if line.is_none() { return; }
+        if line.is_none() {
+            return;
+        }
         let line = line.unwrap();
-        let next = utils::find_next_word(line, self.c+1);
+        let next = utils::find_next_word(line, self.c + 1);
         self.c = next;
         self.upd = true;
         self.focus();
@@ -1400,9 +1499,11 @@ impl Editor {
 
     fn handle_left_word(&mut self) {
         let line = self.code.line_at(self.r);
-        if line.is_none() { return; }
+        if line.is_none() {
+            return;
+        }
         let line = line.unwrap();
-        let next = utils::find_prev_word(line, self.c-1);
+        let next = utils::find_prev_word(line, self.c - 1);
         self.c = next;
         self.upd = true;
         self.focus();
@@ -1423,15 +1524,22 @@ impl Editor {
                 self.code.insert_text(&indentation, self.r, self.c);
 
                 if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
-                    lsp.lock().await.did_change(
-                        self.r, self.c, self.r, self.c,
-                        &self.code.abs_path, &indentation
-                    ).await;
+                    lsp.lock()
+                        .await
+                        .did_change(
+                            self.r,
+                            self.c,
+                            self.r,
+                            self.c,
+                            &self.code.abs_path,
+                            &indentation,
+                        )
+                        .await;
                 }
 
                 self.c = indentation.width();
-            },
-            None => {},
+            }
+            None => {}
         }
         self.focus();
         self.clean_diagnostics();
@@ -1445,32 +1553,37 @@ impl Editor {
             return;
         }
 
-        if self.code.indent_unit().is_some() && self.c != 0
+        if self.code.indent_unit().is_some()
+            && self.c != 0
             && self.code.is_only_indentation_before(self.r, self.c)
-            && self.code.indentation_level(self.r) > 0 {
+            && self.code.indentation_level(self.r) > 0
+        {
             // remove indentations only
 
             let remove_all_indents = false;
 
             let il = self.code.indentation_level(self.r);
-            let mut indent_from = match self.code.indent_unit() { // vscode like removal
-                Some(unit) if unit == "\t" =>  il-1,
+            let mut indent_from = match self.code.indent_unit() {
+                // vscode like removal
+                Some(unit) if unit == "\t" => il - 1,
                 Some(unit) if unit == " " => {
                     let w = self.code.indent_width().unwrap_or(2);
-                    w * (il-1)
-                },
+                    w * (il - 1)
+                }
                 _ => self.c - 1,
             };
 
-            if remove_all_indents { indent_from = 0 }  // idea like removal
+            if remove_all_indents {
+                indent_from = 0
+            } // idea like removal
 
             self.code.remove_text(self.r, indent_from, self.r, self.c);
 
             if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
-                lsp.lock().await.did_change(
-                    self.r, indent_from, self.r, self.c,
-                    &self.code.abs_path, ""
-                ).await;
+                lsp.lock()
+                    .await
+                    .did_change(self.r, indent_from, self.r, self.c, &self.code.abs_path, "")
+                    .await;
             }
 
             self.c = indent_from;
@@ -1478,7 +1591,9 @@ impl Editor {
             self.clean_diagnostics();
             self.reset_highlight_cache();
 
-            if remove_all_indents == false { return }
+            if remove_all_indents == false {
+                return;
+            }
         }
 
         if self.c > 0 {
@@ -1486,10 +1601,10 @@ impl Editor {
             self.code.remove_char(self.r, self.c);
 
             if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
-                lsp.lock().await.did_change(
-                    self.r, self.c - 1, self.r,
-                    self.c, &self.code.abs_path, ""
-                ).await;
+                lsp.lock()
+                    .await
+                    .did_change(self.r, self.c - 1, self.r, self.c, &self.code.abs_path, "")
+                    .await;
             }
 
             self.c -= 1;
@@ -1500,13 +1615,21 @@ impl Editor {
             // remove enter char
             let prev_line_len = self.code.line_len(self.r - 1);
             // self.code.remove_char(self.r, self.c);
-            self.code.remove_text(self.r - 1, prev_line_len, self.r, self.c);
+            self.code
+                .remove_text(self.r - 1, prev_line_len, self.r, self.c);
 
             if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
-                lsp.lock().await.did_change(
-                    self.r - 1, prev_line_len,
-                    self.r, self.c, &self.code.abs_path, ""
-                ).await;
+                lsp.lock()
+                    .await
+                    .did_change(
+                        self.r - 1,
+                        prev_line_len,
+                        self.r,
+                        self.c,
+                        &self.code.abs_path,
+                        "",
+                    )
+                    .await;
             }
 
             self.r -= 1;
@@ -1520,27 +1643,27 @@ impl Editor {
     }
 
     fn copy_to_clipboard(&mut self, maybe_text: Option<String>) {
-
         let text = match maybe_text {
             Some(text) => text,
             None => {
-                if self.selection.empty() { return; }
+                if self.selection.empty() {
+                    return;
+                }
                 let (y, x) = self.selection.from();
                 let (yto, xto) = self.selection.to();
                 let text = self.code.get_text(y, x, yto, xto);
                 text
-            },
+            }
         };
 
-        let result = arboard::Clipboard::new()
-            .and_then(|mut c| c.set_text(text.to_string()));
+        let result = arboard::Clipboard::new().and_then(|mut c| c.set_text(text.to_string()));
 
         if result.is_err() {
             self.clipboard = Some(text.to_string());
         }
     }
 
-    fn get_clipboard(& self) -> anyhow::Result<String> {
+    fn get_clipboard(&self) -> anyhow::Result<String> {
         let maybe_text = arboard::Clipboard::new()
             .and_then(|mut c| c.get_text())
             .ok()
@@ -1562,7 +1685,9 @@ impl Editor {
     }
 
     async fn paste(&mut self, text: String) {
-        if text.is_empty() { return; }
+        if text.is_empty() {
+            return;
+        }
 
         if self.selection.non_empty_and_active() {
             self.handle_cut().await;
@@ -1574,16 +1699,21 @@ impl Editor {
         let lang = &self.code.lang;
 
         if let Some(lsp) = self.lang2lsp.get(lang) {
-            lsp.lock().await.did_change(
-                self.r, self.c, self.r,
-                self.c, &path, &text
-            ).await;
+            lsp.lock()
+                .await
+                .did_change(self.r, self.c, self.r, self.c, &path, &text)
+                .await;
         }
 
-        for ch in text.chars() { match ch {
-            '\n' => { self.r += 1; self.c = 0; }
-            _ => self.c += ch.width().unwrap_or(1),
-        }}
+        for ch in text.chars() {
+            match ch {
+                '\n' => {
+                    self.r += 1;
+                    self.c = 0;
+                }
+                _ => self.c += ch.width().unwrap_or(1),
+            }
+        }
 
         self.upd = true;
         self.focus();
@@ -1607,15 +1737,21 @@ impl Editor {
             let lang = &self.code.lang;
 
             if let Some(lsp) = self.lang2lsp.get(lang) {
-                lsp.lock().await.did_change(
-                    self.r, self.c, self.r, self.c, &path, &text
-                ).await;
+                lsp.lock()
+                    .await
+                    .did_change(self.r, self.c, self.r, self.c, &path, &text)
+                    .await;
             }
 
-            for ch in text.chars() { match ch {
-                '\n' => { self.r += 1; self.c = 0; }
-                _ => self.c += ch.width().unwrap_or(1),
-            }}
+            for ch in text.chars() {
+                match ch {
+                    '\n' => {
+                        self.r += 1;
+                        self.c = 0;
+                    }
+                    _ => self.c += ch.width().unwrap_or(1),
+                }
+            }
 
             self.selection.clean();
             self.selection.keep_once = false;
@@ -1623,7 +1759,6 @@ impl Editor {
             self.focus();
             self.clean_diagnostics();
             self.reset_highlight_cache();
-
         } else if self.r < self.code.len_lines() - 1 {
             let text = self.code.get_text(self.r, 0, self.r + 1, 0);
             self.r += 1;
@@ -1634,11 +1769,17 @@ impl Editor {
 
             if let Some(lsp) = self.lang2lsp.get(lang) {
                 let change_text = format!("\n{}", &text);
-                lsp.lock().await.did_change(
-                    self.r-1, text.len(),
-                    self.r-1, text.len(),
-                    path, &change_text
-                ).await;
+                lsp.lock()
+                    .await
+                    .did_change(
+                        self.r - 1,
+                        text.len(),
+                        self.r - 1,
+                        text.len(),
+                        path,
+                        &change_text,
+                    )
+                    .await;
             }
 
             self.upd = true;
@@ -1649,7 +1790,9 @@ impl Editor {
     }
 
     async fn handle_cut(&mut self) {
-        if self.selection.empty() { return; }
+        if self.selection.empty() {
+            return;
+        }
 
         let (y, x) = self.selection.from();
         let (yto, xto) = self.selection.to();
@@ -1678,10 +1821,14 @@ impl Editor {
         let lang = &self.code.lang;
 
         if let Some(lsp) = self.lang2lsp.get(lang) {
-            lsp.lock().await.did_change(self.r, 0, self.r + 1, 0,  path, "").await;
+            lsp.lock()
+                .await
+                .did_change(self.r, 0, self.r + 1, 0, path, "")
+                .await;
         }
 
-        if self.c > self.code.line_len(self.r) { // fit to line
+        if self.c > self.code.line_len(self.r) {
+            // fit to line
             self.c = self.code.line_len(self.r);
         }
 
@@ -1696,7 +1843,8 @@ impl Editor {
         if self.y + self.height >= self.code.len_lines() {
             return;
         }
-        self.y += 1;
+
+        self.y += min(self.code.len_lines() - self.y - self.height, 3);
         self.upd = true;
     }
 
@@ -1704,14 +1852,16 @@ impl Editor {
         if self.y == 0 {
             return;
         }
-        self.y -= 1;
+        self.y -= min(self.y, 3);
         self.upd = true;
     }
 
     fn focus(&mut self) {
         let area = Rect::new(
-            (self.lp_width) as u16, 0 as u16,
-            self.width as u16, self.height as u16,
+            (self.lp_width) as u16,
+            0 as u16,
+            self.width as u16,
+            self.height as u16,
         );
 
         let width = area.width as usize;
@@ -1744,7 +1894,9 @@ impl Editor {
     }
 
     async fn insert_char(&mut self, c: char) {
-        if self.selection.non_empty_and_active() { self.handle_cut().await;}
+        if self.selection.non_empty_and_active() {
+            self.handle_cut().await;
+        }
 
         self.code.insert_char(c, self.r, self.c);
 
@@ -1752,7 +1904,10 @@ impl Editor {
         let lang = &self.code.lang;
 
         if let Some(lsp) = self.lang2lsp.get(lang) {
-            lsp.lock().await.did_change(self.r, self.c, self.r, self.c, path, &c.to_string()).await;
+            lsp.lock()
+                .await
+                .did_change(self.r, self.c, self.r, self.c, path, &c.to_string())
+                .await;
         }
 
         self.c += 1;
@@ -1764,13 +1919,16 @@ impl Editor {
     }
 
     async fn insert_tab(&mut self) {
-        let (r,c) = (self.r, self.c);
-        let inserted = self.code.insert_tab(r,c);
+        let (r, c) = (self.r, self.c);
+        let inserted = self.code.insert_tab(r, c);
 
         self.c += inserted.width();
 
         if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
-            lsp.lock().await.did_change(r,c, r,c, &self.code.abs_path, &inserted).await;
+            lsp.lock()
+                .await
+                .did_change(r, c, r, c, &self.code.abs_path, &inserted)
+                .await;
         }
         self.upd = true;
         self.focus();
@@ -1780,42 +1938,62 @@ impl Editor {
 
     async fn comment_line(&mut self) {
         let comment = self.code.get_lang_comment();
-        if comment.is_none() { return; }
+        if comment.is_none() {
+            return;
+        }
         let comment = comment.unwrap();
 
         match self.code.find_comment(self.r) {
-            Some(comment_index) => {  // uncomment line
+            Some(comment_index) => {
+                // uncomment line
                 let comment_len = comment.len();
-                self.code.remove_text(self.r, comment_index, self.r, comment_index + comment_len);
+                self.code
+                    .remove_text(self.r, comment_index, self.r, comment_index + comment_len);
 
-                let path = &self.code.abs_path; let lang = &self.code.lang;
+                let path = &self.code.abs_path;
+                let lang = &self.code.lang;
 
                 if let Some(lsp) = self.lang2lsp.get(lang) {
-                    lsp.lock().await.did_change(
-                        self.r, comment_index,
-                        self.r, comment_index + comment_len,
-                        path, ""
-                    ).await;
+                    lsp.lock()
+                        .await
+                        .did_change(
+                            self.r,
+                            comment_index,
+                            self.r,
+                            comment_index + comment_len,
+                            path,
+                            "",
+                        )
+                        .await;
                 }
-
-            },
-            None => {  // comment line
-                let first_non_whitespace = self.code
+            }
+            None => {
+                // comment line
+                let first_non_whitespace = self
+                    .code
                     .find_first_non_whitespace(self.r, self.c)
                     .unwrap_or(0);
 
-                self.code.insert_text(&comment, self.r, first_non_whitespace);
+                self.code
+                    .insert_text(&comment, self.r, first_non_whitespace);
 
-                let path = &self.code.abs_path; let lang = &self.code.lang;
+                let path = &self.code.abs_path;
+                let lang = &self.code.lang;
 
                 if let Some(lsp) = self.lang2lsp.get(lang) {
-                    lsp.lock().await.did_change(
-                        self.r, first_non_whitespace,
-                        self.r, first_non_whitespace,
-                        &path, &comment
-                    ).await;
+                    lsp.lock()
+                        .await
+                        .did_change(
+                            self.r,
+                            first_non_whitespace,
+                            self.r,
+                            first_non_whitespace,
+                            &path,
+                            &comment,
+                        )
+                        .await;
                 }
-            },
+            }
         }
 
         self.upd = true;
@@ -1835,9 +2013,7 @@ impl Editor {
         let maybe_change = self.code.undo();
         match maybe_change {
             Some(changes) => {
-
                 for change in changes.changes {
-
                     self.r = change.row;
                     self.c = change.column;
                     let text = &change.text;
@@ -1849,38 +2025,49 @@ impl Editor {
                             let mut r_end = r;
                             let mut c_end = c;
 
-                            for ch in text.chars() { match ch {
-                                '\n' => { r_end += 1; c_end = 0;}
-                                _ => c_end += 1,
-                            }}
+                            for ch in text.chars() {
+                                match ch {
+                                    '\n' => {
+                                        r_end += 1;
+                                        c_end = 0;
+                                    }
+                                    _ => c_end += 1,
+                                }
+                            }
 
                             if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
-                                lsp.lock().await.did_change(
-                                    r, c, r_end, c_end, &self.code.abs_path, ""
-                                ).await;
+                                lsp.lock()
+                                    .await
+                                    .did_change(r, c, r_end, c_end, &self.code.abs_path, "")
+                                    .await;
                             }
-                        },
+                        }
                         crate::code::Operation::Remove => {
                             let mut r = change.row;
                             let mut c = change.column;
 
-                            for ch in text.chars() { match ch {
-                                '\n' => { r -= 1; c = 0;}
-                                _ => c = c.saturating_sub(1),
-                            }}
+                            for ch in text.chars() {
+                                match ch {
+                                    '\n' => {
+                                        r -= 1;
+                                        c = 0;
+                                    }
+                                    _ => c = c.saturating_sub(1),
+                                }
+                            }
                             if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
-                                lsp.lock().await.did_change(
-                                    r, c,  r, c, &self.code.abs_path, &change.text
-                                ).await;
+                                lsp.lock()
+                                    .await
+                                    .did_change(r, c, r, c, &self.code.abs_path, &change.text)
+                                    .await;
                             }
                         }
-                        crate::code::Operation::Start => {},
-                        crate::code::Operation::End => {},
+                        crate::code::Operation::Start => {}
+                        crate::code::Operation::End => {}
                     }
-
                 }
-            },
-            None => {},
+            }
+            None => {}
         }
         self.upd = true;
         self.focus();
@@ -1904,39 +2091,58 @@ impl Editor {
                             let mut r_end = r;
                             let mut c_end = c;
 
-                            for ch in text.chars() { match ch {
-                                '\n' => { r_end += 1; c_end = 0;}
-                                _ => c_end += 1,
-                            }}
+                            for ch in text.chars() {
+                                match ch {
+                                    '\n' => {
+                                        r_end += 1;
+                                        c_end = 0;
+                                    }
+                                    _ => c_end += 1,
+                                }
+                            }
 
                             self.c += 1;
 
                             if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
-                                lsp.lock().await.did_change(
-                                    r, c, r_end, c_end, &self.code.abs_path, &change.text
-                                ).await;
+                                lsp.lock()
+                                    .await
+                                    .did_change(
+                                        r,
+                                        c,
+                                        r_end,
+                                        c_end,
+                                        &self.code.abs_path,
+                                        &change.text,
+                                    )
+                                    .await;
                             }
-                        },
+                        }
                         crate::code::Operation::Remove => {
                             let mut r = change.row;
                             let mut c = change.column;
 
-                            for ch in text.chars() { match ch {
-                                '\n' => { r -= 1; c = 0;}
-                                _ => c -= 1,
-                            }}
+                            for ch in text.chars() {
+                                match ch {
+                                    '\n' => {
+                                        r -= 1;
+                                        c = 0;
+                                    }
+                                    _ => c -= 1,
+                                }
+                            }
                             if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
-                                lsp.lock().await.did_change(
-                                    r, c, r, c, &self.code.abs_path, ""
-                                ).await;
+                                lsp.lock()
+                                    .await
+                                    .did_change(r, c, r, c, &self.code.abs_path, "")
+                                    .await;
                             }
                         }
-                        crate::code::Operation::Start => {},
-                        crate::code::Operation::End => {},
+                        crate::code::Operation::Start => {}
+                        crate::code::Operation::End => {}
                     }
                 }
-            },
-            None => {},
+            }
+            None => {}
         }
         self.upd = true;
         self.focus();
@@ -1946,9 +2152,7 @@ impl Editor {
 
     fn update_search_results(&mut self) {
         if self.search.pattern.len_chars() > 0 {
-            let search_results = self.code.search(
-                &self.search.pattern.to_string()
-            );
+            let search_results = self.code.search(&self.search.pattern.to_string());
 
             self.search.results = search_results
                 .iter()
@@ -1959,7 +2163,9 @@ impl Editor {
                 })
                 .collect();
 
-            let closest_to_cursor = self.search.results
+            let closest_to_cursor = self
+                .search
+                .results
                 .iter()
                 .enumerate()
                 .min_by_key(|(_, result)| {
@@ -1970,7 +2176,6 @@ impl Editor {
                 .map(|(i, _)| i);
 
             self.search.index = closest_to_cursor.unwrap_or(0);
-
         } else {
             self.search.results.clear();
             self.search.index = 0;
@@ -2018,7 +2223,8 @@ impl Editor {
                 }
                 self.selection.active = true;
                 self.selection.set_start(sy, sx);
-                self.selection.set_end(sy, sx + self.search.pattern.to_string().width());
+                self.selection
+                    .set_end(sy, sx + self.search.pattern.to_string().width());
                 self.upd = true;
                 self.draw().await;
                 self.draw_search_line(self.search.cursor_pos, self.height - 1);
@@ -2039,6 +2245,16 @@ impl Editor {
                 maybe_event = event => {
                     match maybe_event {
                         Some(Ok(event)) => {
+
+                            #[cfg(target_os = "windows")]
+                            {
+                                if let Event::Key(key_event) = event {
+                                    if key_event.kind == KeyEventKind::Release {
+                                        continue;
+                                    }
+                                }
+                            }
+
                             match event {
                                 Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
                                     self.r = saved_r; self.c = saved_c;
@@ -2083,23 +2299,24 @@ impl Editor {
                 false
             }
             Event::Key(key_event) => {
-
                 if key_event.modifiers == KeyModifiers::CONTROL
-                    && key_event.code == KeyCode::Char('v') {
-                        if let Ok(pasted_text) = self.get_clipboard() {
-                            self.clean_search_line();
-                            for ch in pasted_text.chars() {
-                                self.search.pattern.insert_char(self.search.cursor_pos, ch);
-                                self.search.cursor_pos += 1;
-                            }
-                            self.update_search_results();
+                    && key_event.code == KeyCode::Char('v')
+                {
+                    if let Ok(pasted_text) = self.get_clipboard() {
+                        self.clean_search_line();
+                        for ch in pasted_text.chars() {
+                            self.search.pattern.insert_char(self.search.cursor_pos, ch);
+                            self.search.cursor_pos += 1;
                         }
+                        self.update_search_results();
+                    }
                     return false;
                 }
 
                 if key_event.modifiers == KeyModifiers::CONTROL
-                    && key_event.code == KeyCode::Char('g') {
-                    self.hanle_global_search().await;
+                    && key_event.code == KeyCode::Char('g')
+                {
+                    self.handle_global_search().await;
                     self.overlay_lines.clear();
                     return true;
                 }
@@ -2136,7 +2353,7 @@ impl Editor {
                     }
                     KeyCode::Enter => {
                         if self.code.file_name.is_empty() {
-                            self.hanle_global_search().await;
+                            self.handle_global_search().await;
                             self.overlay_lines.clear();
                             self.upd = true;
                             if self.code.file_name.is_empty() {
@@ -2151,7 +2368,9 @@ impl Editor {
                         if self.search.cursor_pos > 0 {
                             self.search.cursor_pos -= 1;
                             self.clean_search_line();
-                            self.search.pattern.remove(self.search.cursor_pos..self.search.cursor_pos + 1);
+                            self.search
+                                .pattern
+                                .remove(self.search.cursor_pos..self.search.cursor_pos + 1);
                             self.update_search_results();
                         }
                         false
@@ -2173,21 +2392,25 @@ impl Editor {
         }
     }
 
-    pub fn draw_search_line(&mut self, x:usize, y:usize) {
+    pub fn draw_search_line(&mut self, x: usize, y: usize) {
         let prefix = "search: ";
         let space = " ".repeat(10);
         let line = if !self.search.results.is_empty() && self.search.pattern.len_chars() > 0 {
-            let postfix = format!("{}/{}", self.search.index+1, self.search.results.len());
+            let postfix = format!("{}/{}", self.search.index + 1, self.search.results.len());
             format!("{}{} {}{}", prefix, &self.search.pattern, postfix, space)
         } else {
             format!("{}{} {}", prefix, &self.search.pattern, space)
         };
 
-        let _ = queue!(stdout(),
-            cursor::MoveTo((self.lp_width) as u16, (self.height-1) as u16),
-            BColor(Color::Reset), FColor(Color::Reset), Print(line),
+        let _ = queue!(
+            stdout(),
+            cursor::MoveTo((self.lp_width) as u16, (self.height - 1) as u16),
+            BColor(Color::Reset),
+            FColor(Color::Reset),
+            Print(line),
         );
-        let _ = queue!(stdout(),
+        let _ = queue!(
+            stdout(),
             cursor::MoveTo((self.lp_width + prefix.len() + x) as u16, y as u16),
         );
 
@@ -2197,15 +2420,18 @@ impl Editor {
     pub fn clean_search_line(&mut self) {
         let prefix = "search: ";
         let line = if !self.search.results.is_empty() && self.search.pattern.len_chars() > 0 {
-            let postfix = format!("{}/{}", self.search.index+1, self.search.results.len());
+            let postfix = format!("{}/{}", self.search.index + 1, self.search.results.len());
             format!("{}{} {}", prefix, &self.search.pattern, postfix)
         } else {
             format!("{}{}", prefix, &self.search.pattern)
         };
 
-        let _ = queue!(stdout(),
-            cursor::MoveTo((self.lp_width + 1) as u16, (self.height-1) as u16),
-            BColor(Color::Reset), FColor(Color::Reset), Print(" ".repeat(line.to_string().width())),
+        let _ = queue!(
+            stdout(),
+            cursor::MoveTo((self.lp_width + 1) as u16, (self.height - 1) as u16),
+            BColor(Color::Reset),
+            FColor(Color::Reset),
+            Print(" ".repeat(line.to_string().width())),
         );
 
         let _ = stdout().flush();
@@ -2213,7 +2439,9 @@ impl Editor {
 
     pub fn init_new_lsp(&mut self) {
         let lang = self.code.lang.clone();
-        if self.lang2lsp.contains_key(&lang) { return; }
+        if self.lang2lsp.contains_key(&lang) {
+            return;
+        }
 
         let lsp = Arc::new(Mutex::new(lsp::Lsp::new()));
         let lsp_clone = lsp.clone();
@@ -2222,14 +2450,18 @@ impl Editor {
         let file_content = self.code.text.to_string();
 
         self.lang2lsp.insert(lang.clone(), lsp_clone);
-        let diagnostic_send = self.diagnostics_sender.as_mut().map(|s|s.clone()).unwrap();
+        let diagnostic_send = self.diagnostics_sender.as_mut().map(|s| s.clone()).unwrap();
 
-        let lsp_cmd = self.code.get_lang_conf()
+        let lsp_cmd = self
+            .code
+            .get_lang_conf()
             .map(|c| c.lsp.clone())
             .flatten()
             .map(|l| l.join(" "));
 
-        if lsp_cmd.is_none() { return; }
+        if lsp_cmd.is_none() {
+            return;
+        }
 
         let lsp_cmd = lsp_cmd.unwrap();
 
@@ -2240,11 +2472,11 @@ impl Editor {
             let result = lsp.start(&lang, &lsp_cmd, Some(diagnostic_send));
 
             match result {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => {
                     debug!("error starting lsp process {}", e.to_string());
                     return;
-                },
+                }
             }
 
             let dir = utils::current_dir();
@@ -2262,13 +2494,15 @@ impl Editor {
                 let mut lsp = lsp.lock().await;
                 let file_content = self.code.text.to_string();
                 lsp.did_open(&self.code.lang, &self.code.abs_path, &file_content);
-            },
-            None => {},
+            }
+            None => {}
         }
     }
 
     pub fn clean_diagnostics(&mut self) {
-        let uri = format!("file://{}", self.code.abs_path);
+        let uri: String = url::Url::from_file_path(&self.code.abs_path)
+            .unwrap()
+            .to_string();
         self.diagnostics.clone().try_lock().unwrap().remove(&uri);
     }
 
@@ -2279,7 +2513,6 @@ impl Editor {
     }
 
     pub async fn completion(&mut self) {
-
         loop {
             let mut changed = false;
 
@@ -2292,10 +2525,13 @@ impl Editor {
             };
 
             let mut completion_result = match completion_result {
-                Ok(c) => c, Err(_) => return,
+                Ok(c) => c,
+                Err(_) => return,
             };
 
-            if completion_result.is_empty() { return; }
+            if completion_result.is_empty() {
+                return;
+            }
 
             self.set_lsp_status("lsp completion").await;
 
@@ -2303,11 +2539,16 @@ impl Editor {
             let height = 5;
 
             let line = match self.code.line_at(self.r) {
-                Some(line) => line, None => return,
+                Some(line) => line,
+                None => return,
             };
 
             let prev = utils::find_prev_word(line, self.c);
-            let prev_word = line.chars().skip(prev).take(self.c - prev).collect::<String>();
+            let prev_word = line
+                .chars()
+                .skip(prev)
+                .take(self.c - prev)
+                .collect::<String>();
 
             // Sort completion items by matches score
             completion_result.sort_by(|a, b| {
@@ -2316,15 +2557,21 @@ impl Editor {
                 let r = sb.cmp(&sa);
                 if r == Ordering::Equal {
                     a.label.len().cmp(&b.label.len())
-                } else { r }
+                } else {
+                    r
+                }
             });
 
             let options = &completion_result;
 
             while !changed {
                 // calculate scrolling offsets
-                if selected < selected_offset { selected_offset = selected }
-                if selected >= selected_offset + height { selected_offset = selected - height + 1 }
+                if selected < selected_offset {
+                    selected_offset = selected
+                }
+                if selected >= selected_offset + height {
+                    selected_offset = selected - height + 1
+                }
 
                 self.draw_completion(height, options, selected, selected_offset);
 
@@ -2401,7 +2648,11 @@ impl Editor {
     }
 
     pub fn draw_completion(
-        &mut self, height: usize, options: &Vec<lsp_types::CompletionItem>, selected: usize, offset: usize,
+        &mut self,
+        height: usize,
+        options: &Vec<lsp_types::CompletionItem>,
+        selected: usize,
+        offset: usize,
     ) {
         let max_height: usize = options.len().min(height);
         let max_width: usize = 30;
@@ -2411,15 +2662,18 @@ impl Editor {
         let (word_start, _) = self.code.word_boundaries(word_offset);
         let (_, word_start_col) = self.code.point(word_start);
 
-        let max_label_width = options.iter().map(|o| o.label.len()).max().unwrap_or(max_width);
+        let max_label_width = options
+            .iter()
+            .map(|o| o.label.len())
+            .max()
+            .unwrap_or(max_width);
 
         let cursor_screen_row = self.r - self.y;
         let available_below = self.height.saturating_sub(cursor_screen_row + 1);
 
         let visible_height = options.len().min(max_height);
 
-        let draw_above = available_below < max_height
-            && cursor_screen_row >= max_height;
+        let draw_above = available_below < max_height && cursor_screen_row >= max_height;
 
         let from_y = if draw_above {
             cursor_screen_row.saturating_sub(visible_height)
@@ -2435,9 +2689,15 @@ impl Editor {
 
             let option = &options[i];
             let is_selected = selected == i;
-            let bgcolor = if is_selected { Color::Grey } else { Color::Reset };
+            let bgcolor = if is_selected {
+                Color::Grey
+            } else {
+                Color::Reset
+            };
 
-            let limit = self.width.saturating_sub(self.lp_width + ln_width + word_start_col);
+            let limit = self
+                .width
+                .saturating_sub(self.lp_width + ln_width + word_start_col);
             let label = format!(" {:width$} ", option.label, width = max_label_width)
                 .chars()
                 .take(limit)
@@ -2460,13 +2720,14 @@ impl Editor {
         self.draw_cursor();
     }
 
-    pub async fn lsp_completion_apply(
-        &mut self, item: &lsp_types::CompletionItem
-    ) {
-        if item.text_edit.is_none() && item.label.is_empty() { return; }
+    pub async fn lsp_completion_apply(&mut self, item: &lsp_types::CompletionItem) {
+        if item.text_edit.is_none() && item.label.is_empty() {
+            return;
+        }
 
         let line = match self.code.line_at(self.r) {
-            Some(line) => line, None => return,
+            Some(line) => line,
+            None => return,
         };
 
         let prev = utils::find_prev_word(line, self.c);
@@ -2485,8 +2746,14 @@ impl Editor {
         let lang = &self.code.lang;
 
         if let Some(lsp) = self.lang2lsp.get(lang) {
-            lsp.lock().await.did_change(self.r, prev, self.r, next,  &path, "").await;
-            lsp.lock().await.did_change(self.r, prev, self.r, prev, &path, insert_text).await;
+            lsp.lock()
+                .await
+                .did_change(self.r, prev, self.r, next, &path, "")
+                .await;
+            lsp.lock()
+                .await
+                .did_change(self.r, prev, self.r, prev, &path, insert_text)
+                .await;
         }
 
         self.c = prev + insert_text.len();
@@ -2501,7 +2768,7 @@ impl Editor {
 
         let definition_result = match self.lang2lsp.get(lang) {
             Some(lsp) => lsp.lock().await.definition(&path, self.r, self.c).await,
-            None => { return },
+            None => return,
         };
 
         let definition = match &definition_result {
@@ -2511,14 +2778,25 @@ impl Editor {
 
         self.save_cursor_to_history();
 
-        if definition.uri.to_string() != format!("file://{}", self.code.abs_path) {
-            let path = definition.uri.to_string().split("file://").nth(1).unwrap().to_string();
+        if definition.uri.to_string()
+            != url::Url::from_file_path(&self.code.abs_path)
+                .unwrap()
+                .to_string()
+        {
+            let path = definition
+                .uri
+                .to_string()
+                .split("file://")
+                .nth(1)
+                .unwrap()
+                .to_string();
             self.open_file(&path).await;
         }
 
-        if definition.range.start.line as usize > self.code.len_lines() ||
-            definition.range.start.character as usize >
-                self.code.line_len(definition.range.start.line as usize) {
+        if definition.range.start.line as usize > self.code.len_lines()
+            || definition.range.start.character as usize
+                > self.code.line_len(definition.range.start.line as usize)
+        {
             return;
         }
 
@@ -2543,7 +2821,12 @@ impl Editor {
             let start = Instant::now();
 
             let references_result = match self.lang2lsp.get(&self.code.lang) {
-                Some(lsp) => lsp.lock().await.references(&self.code.abs_path, self.r, self.c).await,
+                Some(lsp) => {
+                    lsp.lock()
+                        .await
+                        .references(&self.code.abs_path, self.r, self.c)
+                        .await
+                }
                 None => return,
             };
 
@@ -2554,27 +2837,46 @@ impl Editor {
                 _ => return,
             };
 
-            if references.len() == 0 { return; }
-            if references.len() == 1 { self.apply_reference(&references[0]).await; return; }
+            if references.len() == 0 {
+                return;
+            }
+            if references.len() == 1 {
+                self.apply_reference(&references[0]).await;
+                return;
+            }
 
             let max_visible = 3;
             let (mut selected, mut selected_offset) = (0, 0);
             let (height, width) = (max_visible, 30);
-            self.upd = true; self.tree_view.upd = true;
+            self.upd = true;
+            self.tree_view.upd = true;
 
             self.overlay_lines.clear();
 
             let mut reader = EventStream::new();
 
             loop {
-
-                if selected < selected_offset { selected_offset = selected } // calculate scrolling offsets
-                if selected >= selected_offset + height { selected_offset = selected - height + 1 }
+                if selected < selected_offset {
+                    selected_offset = selected
+                } // calculate scrolling offsets
+                if selected >= selected_offset + height {
+                    selected_offset = selected - height + 1
+                }
 
                 let reference = references.get(selected).unwrap();
 
-                if reference.uri.to_string() != format!("file://{}", &self.code.abs_path) {
-                    let path = reference.uri.to_string().split("file://").nth(1).unwrap().to_string();
+                if reference.uri.to_string()
+                    != url::Url::from_file_path(&self.code.abs_path)
+                        .unwrap()
+                        .to_string()
+                {
+                    let path = reference
+                        .uri
+                        .to_string()
+                        .split("file://")
+                        .nth(1)
+                        .unwrap()
+                        .to_string();
                     self.open_file(&path).await;
                 }
 
@@ -2582,16 +2884,32 @@ impl Editor {
                 self.c = reference.range.start.character as usize;
                 self.focus();
                 self.focus_to_center();
-                self.selection.set_start(reference.range.start.line as usize, reference.range.start.character as usize);
-                self.selection.set_end(reference.range.end.line as usize, reference.range.end.character as usize);
+                self.selection.set_start(
+                    reference.range.start.line as usize,
+                    reference.range.start.character as usize,
+                );
+                self.selection.set_end(
+                    reference.range.end.line as usize,
+                    reference.range.end.character as usize,
+                );
                 self.selection.activate();
 
                 let count = std::cmp::min(max_visible, references.len());
                 let fromy = self.height - count - 1;
-                for i in fromy..=self.height { self.overlay_lines.insert(i); }
+                for i in fromy..=self.height {
+                    self.overlay_lines.insert(i);
+                }
 
                 self.draw().await;
-                self.draw_references(height, width, fromy, &references, selected, selected_offset, elapsed);
+                self.draw_references(
+                    height,
+                    width,
+                    fromy,
+                    &references,
+                    selected,
+                    selected_offset,
+                    elapsed,
+                );
                 self.draw_cursor();
 
                 let mut event = reader.next().fuse();
@@ -2641,8 +2959,18 @@ impl Editor {
 
     async fn apply_reference(&mut self, reference: &lsp_types::Location) {
         self.save_cursor_to_history();
-        if reference.uri.to_string() != format!("file://{}", self.code.abs_path) {
-            let path = reference.uri.to_string().split("file://").nth(1).unwrap().to_string();
+        if reference.uri.to_string()
+            != url::Url::from_file_path(&self.code.abs_path)
+                .unwrap()
+                .to_string()
+        {
+            let path = reference
+                .uri
+                .to_string()
+                .split("file://")
+                .nth(1)
+                .unwrap()
+                .to_string();
             self.open_file(&path).await;
         }
         self.r = reference.range.start.line as usize;
@@ -2655,39 +2983,65 @@ impl Editor {
 
     pub fn draw_references(
         &mut self,
-        height: usize, width:usize, fromy:usize,
+        height: usize,
+        width: usize,
+        fromy: usize,
         options: &Vec<lsp_types::Location>,
-        selected: usize, offset: usize, elapsed:u128
+        selected: usize,
+        offset: usize,
+        elapsed: u128,
     ) {
-        let options: Vec<String> = options.iter().enumerate().map(|(i, reff)| {
-            format!(
-                "{}/{} {}:{} {}", i+1, options.len(), reff.uri.to_string().split("file://").nth(1).unwrap(),
-                    reff.range.start.line, reff.range.start.character,
+        let options: Vec<String> = options
+            .iter()
+            .enumerate()
+            .map(|(i, reff)| {
+                format!(
+                    "{}/{} {}:{} {}",
+                    i + 1,
+                    options.len(),
+                    reff.uri.to_string().split("file://").nth(1).unwrap(),
+                    reff.range.start.line,
+                    reff.range.start.character,
                 )
-        }).collect();
+            })
+            .collect();
 
         let width = options.iter().map(|o| o.len()).max().unwrap_or(width);
 
         for row in 0..options.len() {
-            if row >= options.len() || row >= height { break; }
+            if row >= options.len() || row >= height {
+                break;
+            }
             let option = &options[row + offset];
 
             let is_selected = selected == row + offset;
-            let bgcolor = if is_selected { Color::Grey } else { Color::Reset };
+            let bgcolor = if is_selected {
+                Color::Grey
+            } else {
+                Color::Reset
+            };
 
             let label = format!(" {:width$} ", option, width = width);
 
-            let _ = queue!(stdout(),
+            let _ = queue!(
+                stdout(),
                 cursor::MoveTo(self.lp_width as u16, (row + fromy) as u16),
-                BColor(bgcolor), FColor(self.lncolor), Print(label),  BColor(Color::Reset), FColor(Color::Reset),
+                BColor(bgcolor),
+                FColor(self.lncolor),
+                Print(label),
+                BColor(Color::Reset),
+                FColor(Color::Reset),
             );
         }
 
         let status = format!("lsp references, elapsed {} ms {}", elapsed, " ".repeat(10));
 
-        let _ = queue!(stdout(),
-            cursor::MoveTo((self.lp_width) as u16, (self.height-1) as u16),
-            BColor(Color::Reset), FColor(Color::Reset), Print(status),
+        let _ = queue!(
+            stdout(),
+            cursor::MoveTo((self.lp_width) as u16, (self.height - 1) as u16),
+            BColor(Color::Reset),
+            FColor(Color::Reset),
+            Print(status),
         );
 
         stdout().flush().expect("cant flush");
@@ -2703,7 +3057,8 @@ impl Editor {
         };
 
         let hover_result = match maybe_hover_result {
-            Ok(hr) => hr, _ => return,
+            Ok(hr) => hr,
+            _ => return,
         };
 
         self.set_lsp_status("lsp completion").await;
@@ -2715,33 +3070,37 @@ impl Editor {
 
         while !end {
             // calculate scrolling offsets
-            if selected < selected_offset { selected_offset = selected }
-            if selected >= selected_offset + height { selected_offset = selected - height + 1 }
+            if selected < selected_offset {
+                selected_offset = selected
+            }
+            if selected >= selected_offset + height {
+                selected_offset = selected - height + 1
+            }
 
             // The original code tried to split hover_result.contents directly, which is an enum, not a string.
             // Instead, we first extract the string value(s) from hover_result.contents, then split into lines.
 
             let value: String = match &hover_result.contents {
-                lsp_types::HoverContents::Scalar(marked_string) => {
-                    match marked_string {
+                lsp_types::HoverContents::Scalar(marked_string) => match marked_string {
+                    lsp_types::MarkedString::String(s) => s.clone(),
+                    lsp_types::MarkedString::LanguageString(ls) => ls.value.clone(),
+                },
+                lsp_types::HoverContents::Array(marked_strings) => marked_strings
+                    .iter()
+                    .map(|marked_string| match marked_string {
                         lsp_types::MarkedString::String(s) => s.clone(),
                         lsp_types::MarkedString::LanguageString(ls) => ls.value.clone(),
-                    }
-                },
-                lsp_types::HoverContents::Array(marked_strings) => {
-                    marked_strings.iter().map(|marked_string| {
-                        match marked_string {
-                            lsp_types::MarkedString::String(s) => s.clone(),
-                            lsp_types::MarkedString::LanguageString(ls) => ls.value.clone(),
-                        }
-                    }).collect::<Vec<String>>().join("\n")
-                },
+                    })
+                    .collect::<Vec<String>>()
+                    .join("\n"),
                 lsp_types::HoverContents::Markup(markup_content) => markup_content.value.clone(),
             };
 
             let options: Vec<String> = value.lines().map(|s| s.to_string()).collect();
 
-            if options.is_empty() { return }
+            if options.is_empty() {
+                return;
+            }
 
             self.draw_hover(height, &options, selected, selected_offset);
 
@@ -2805,8 +3164,7 @@ impl Editor {
 
         let visible_height = options.len().min(max_height);
 
-        let draw_above = available_below < max_height
-            && cursor_screen_row >= max_height;
+        let draw_above = available_below < max_height && cursor_screen_row >= max_height;
 
         let from_y = if draw_above {
             cursor_screen_row.saturating_sub(visible_height)
@@ -2822,9 +3180,15 @@ impl Editor {
 
             let option = &options[i];
             let is_selected = selected == i;
-            let bgcolor = if is_selected { Color::Grey } else { Color::Reset };
+            let bgcolor = if is_selected {
+                Color::Grey
+            } else {
+                Color::Reset
+            };
 
-            let limit = self.width.saturating_sub(self.lp_width + ln_width + word_start_col);
+            let limit = self
+                .width
+                .saturating_sub(self.lp_width + ln_width + word_start_col);
             let label = format!(" {:width$} ", option, width = max_label_width)
                 .chars()
                 .take(limit)
@@ -2855,7 +3219,8 @@ impl Editor {
 
         let (mut selected, mut selected_offset) = (0, 0);
         let (height, width) = (3, 30);
-        self.upd = true; self.tree_view.upd = true;
+        self.upd = true;
+        self.tree_view.upd = true;
 
         let uri = format!("file://{}", self.code.abs_path);
 
@@ -2865,13 +3230,18 @@ impl Editor {
             let maybe_diagnostics = maybe_diagnostics.get(&uri);
 
             let diagnostics: Vec<lsp_types::Diagnostic> = match maybe_diagnostics {
-                Some(d) => d.diagnostics.iter()
+                Some(d) => d
+                    .diagnostics
+                    .iter()
                     // .filter(|d| d.severity == 1)
-                    .map(|d|d.clone()).collect(),
+                    .map(|d| d.clone())
+                    .collect(),
                 None => return,
             };
 
-            if diagnostics.is_empty() { return }
+            if diagnostics.is_empty() {
+                return;
+            }
 
             diagnostics
         };
@@ -2879,24 +3249,39 @@ impl Editor {
         let mut reader = EventStream::new();
 
         loop {
-
-            if selected < selected_offset { selected_offset = selected } // calculate scrolling offsets
-            if selected >= selected_offset + height { selected_offset = selected - height + 1 }
+            if selected < selected_offset {
+                selected_offset = selected
+            } // calculate scrolling offsets
+            if selected >= selected_offset + height {
+                selected_offset = selected - height + 1
+            }
 
             let diagnostic = match diagnostics.get(selected) {
-                Some(d) => d, None => { break },
+                Some(d) => d,
+                None => break,
             };
 
             self.r = diagnostic.range.start.line as usize;
             self.c = diagnostic.range.start.character as usize;
 
-            let fromy = self.height.saturating_sub(std::cmp::min(height, diagnostics.len()));
-            for i in fromy.saturating_sub(1)..=self.height { self.overlay_lines.insert(i); }
+            let fromy = self
+                .height
+                .saturating_sub(std::cmp::min(height, diagnostics.len()));
+            for i in fromy.saturating_sub(1)..=self.height {
+                self.overlay_lines.insert(i);
+            }
 
             self.focus();
             self.focus_to_center();
             self.draw().await;
-            self.draw_errors(height, width, fromy-1, &diagnostics, selected, selected_offset);
+            self.draw_errors(
+                height,
+                width,
+                fromy - 1,
+                &diagnostics,
+                selected,
+                selected_offset,
+            );
             self.draw_cursor();
 
             let mut event = reader.next().fuse();
@@ -2963,57 +3348,94 @@ impl Editor {
 
     pub fn draw_errors(
         &mut self,
-        height: usize, _width: usize, fromy: usize,
+        height: usize,
+        _width: usize,
+        fromy: usize,
         options: &Vec<lsp_types::Diagnostic>,
-        selected: usize, offset: usize
+        selected: usize,
+        offset: usize,
     ) {
         let limit = self.width - self.lp_width - 1;
 
-        let options: Vec<String> = options.iter().enumerate().map(|(i, diagnostic)| {
-            let prefix = format!("{}/{} {}:{} ", i+1, options.len(),
-                diagnostic.range.start.line,
-                diagnostic.range.start.character,
-            );
-            let message: String = diagnostic.message.chars().take(limit-prefix.len()).collect();
-            format!("{}{}", prefix, message)
-        }).collect();
+        let options: Vec<String> = options
+            .iter()
+            .enumerate()
+            .map(|(i, diagnostic)| {
+                let prefix = format!(
+                    "{}/{} {}:{} ",
+                    i + 1,
+                    options.len(),
+                    diagnostic.range.start.line,
+                    diagnostic.range.start.character,
+                );
+                let message: String = diagnostic
+                    .message
+                    .chars()
+                    .take(limit - prefix.len())
+                    .collect();
+                format!("{}{}", prefix, message)
+            })
+            .collect();
 
         for row in 0..options.len() {
-            if row >= options.len() || row >= height { break; }
+            if row >= options.len() || row >= height {
+                break;
+            }
             let option = &options[row + offset];
-            let message = option.replace("\n", " ").chars().take(limit).collect::<String>();
+            let message = option
+                .replace("\n", " ")
+                .chars()
+                .take(limit)
+                .collect::<String>();
 
             let is_selected = selected == row + offset;
-            let bgcolor = if is_selected { Color::Grey } else { Color::Reset };
+            let bgcolor = if is_selected {
+                Color::Grey
+            } else {
+                Color::Reset
+            };
 
-            let _ = queue!(stdout(),
+            let _ = queue!(
+                stdout(),
                 cursor::MoveTo((self.lp_width) as u16, (row + fromy) as u16),
-                BColor(bgcolor), FColor(self.lncolor), Print(message),
-                terminal::Clear(ClearType::UntilNewLine), BColor(Color::Reset), FColor(Color::Reset),
+                BColor(bgcolor),
+                FColor(self.lncolor),
+                Print(message),
+                terminal::Clear(ClearType::UntilNewLine),
+                BColor(Color::Reset),
+                FColor(Color::Reset),
             );
         }
 
         let status = format!("Found {} problems {}", options.len(), " ".repeat(20));
-        let _ = queue!(stdout(),
-            cursor::MoveTo((self.lp_width) as u16, (self.height-1) as u16),
-            BColor(Color::Reset), FColor(Color::Reset), Print(status),
+        let _ = queue!(
+            stdout(),
+            cursor::MoveTo((self.lp_width) as u16, (self.height - 1) as u16),
+            BColor(Color::Reset),
+            FColor(Color::Reset),
+            Print(status),
         );
     }
 
-    fn global_search(& self, pattern: &str) -> Vec<(String, SearchResult)> {
+    fn global_search(&self, pattern: &str) -> Vec<(String, SearchResult)> {
         match search_in_directory(Path::new("./"), pattern) {
-            Ok(results) => results.into_iter()
+            Ok(results) => results
+                .into_iter()
                 .flat_map(|sr| {
                     let path = sr.file_path;
-                    sr.search_results.into_iter().map(move |r| (path.clone(), r))
+                    sr.search_results
+                        .into_iter()
+                        .map(move |r| (path.clone(), r))
                 })
                 .collect(),
             Err(_) => Vec::new(),
         }
     }
 
-    pub async fn hanle_global_search(&mut self) {
-        if self.search.pattern.len_chars() == 0 { return }
+    pub async fn handle_global_search(&mut self) {
+        if self.search.pattern.len_chars() == 0 {
+            return;
+        }
 
         let saved_r = self.r.clone();
         let saved_c = self.c.clone();
@@ -3023,13 +3445,16 @@ impl Editor {
         let max_visible = 3;
         let mut changed = true;
         let (mut selected, mut selected_offset) = (0, 0);
-        self.upd = true; self.tree_view.upd = true;
+        self.upd = true;
+        self.tree_view.upd = true;
 
         self.overlay_lines.clear();
 
         let start = Instant::now();
         let search_results = self.global_search(&self.search.pattern.to_string());
-        if search_results.is_empty() { return }
+        if search_results.is_empty() {
+            return;
+        }
         let elapsed = start.elapsed().as_millis();
 
         let height = max_visible.min(search_results.len());
@@ -3038,9 +3463,12 @@ impl Editor {
         let mut reader = EventStream::new();
 
         loop {
-
-            if selected < selected_offset { selected_offset = selected } // calculate scrolling offsets
-            if selected >= selected_offset + height { selected_offset = selected - height + 1 }
+            if selected < selected_offset {
+                selected_offset = selected
+            } // calculate scrolling offsets
+            if selected >= selected_offset + height {
+                selected_offset = selected - height + 1
+            }
 
             if changed {
                 self.upd = true;
@@ -3052,21 +3480,35 @@ impl Editor {
                     self.open_file(&search_result.0).await;
                 }
 
-                self.r = search_result.1.line-1;
+                self.r = search_result.1.line - 1;
                 self.c = search_result.1.column;
                 self.focus();
                 self.focus_to_center();
-                self.selection.set_start(search_result.1.line-1, search_result.1.column);
+                self.selection
+                    .set_start(search_result.1.line - 1, search_result.1.column);
                 let pattern_len = self.search.pattern.to_string().width();
-                self.selection.set_end(search_result.1.line-1, search_result.1.column + pattern_len);
+                self.selection.set_end(
+                    search_result.1.line - 1,
+                    search_result.1.column + pattern_len,
+                );
                 self.selection.activate();
 
-                let fromy = self.height.saturating_sub(max_visible.min(search_results.len()));
-                for i in fromy.saturating_sub(1)..=self.height { self.overlay_lines.insert(i); }
+                let fromy = self
+                    .height
+                    .saturating_sub(max_visible.min(search_results.len()));
+                for i in fromy.saturating_sub(1)..=self.height {
+                    self.overlay_lines.insert(i);
+                }
 
                 self.draw().await;
                 self.draw_global_search_result(
-                    height, width, fromy-1, &search_results, selected, selected_offset, elapsed
+                    height,
+                    width,
+                    fromy - 1,
+                    &search_results,
+                    selected,
+                    selected_offset,
+                    elapsed,
                 );
                 self.draw_cursor();
                 changed = false;
@@ -3078,40 +3520,51 @@ impl Editor {
                 maybe_event = event => {
                     match maybe_event {
                         Some(Ok(event)) => {
-                            if event == Event::Key(KeyCode::Esc.into()) {
-                                if self.code.abs_path != saved_path {
-                                    self.open_file(&saved_path).await;
+                            if let Event::Key(key_event) = event {
+                                #[cfg(target_os = "windows")]
+                                {
+                                    if key_event.kind == KeyEventKind::Press {
+                                        continue;
+                                    }
                                 }
-                                self.r = saved_r; self.c = saved_c;
-                                self.selection = saved_selection;
-                                self.focus();
-                                self.selection.clean();
 
-                                self.upd = true;
-                                self.tree_view.upd = true;
-                                self.clear_all();
-                                return;
-                            }
-                            if event == Event::Key(KeyCode::Down.into())
-                                && selected < search_results.len() - 1 {
-                                selected += 1;
-                                changed = true;
-                            }
+                                if key_event.code == KeyCode::Esc {
+                                    if self.code.abs_path != saved_path {
+                                        self.open_file(&saved_path).await;
+                                    }
+                                    self.r = saved_r; self.c = saved_c;
+                                    self.selection = saved_selection;
+                                    self.focus();
+                                    self.selection.clean();
 
-                            if event == Event::Key(KeyCode::Up.into()) && selected > 0 {
-                                selected -= 1;
-                                changed = true;
-                            }
+                                    self.upd = true;
+                                    self.tree_view.upd = true;
+                                    self.clear_all();
+                                    return;
+                                }
+                                if key_event.code == KeyCode::Down
+                                    && selected < search_results.len() - 1 {
+                                    selected += 1;
+                                    changed = true;
+                                }
 
-                            if let Event::Resize(w, h) = event {
-                                self.resize(w as usize, h as usize);
-                                changed = true;
-                            }
+                                if key_event.code == KeyCode::Up && selected > 0 {
+                                    selected -= 1;
+                                    changed = true;
+                                }
 
-                            if event == Event::Key(KeyCode::Enter.into())
-                                || event == Event::Key(KeyCode::Tab.into()) {
-                                self.clear_all();
-                                return;
+                                if let Event::Resize(w, h) = event {
+                                    self.resize(w as usize, h as usize);
+                                    changed = true;
+                                }
+
+                                if key_event.code == KeyCode::Enter
+                                    || event == Event::Key(KeyCode::Tab.into()) {
+                                    self.tree_view.upd = true; // <-- missing this!
+                                    self.upd = true;          // <-- missing this!
+                                    self.clear_all();
+                                    return;
+                                }
                             }
                         }
                         Some(Err(e)) => { debug!("Error: {:?}\r", e); return; },
@@ -3122,51 +3575,79 @@ impl Editor {
         }
     }
 
-    pub fn draw_global_search_result(&mut self,
-        height: usize, width:usize, fromy: usize,
+    pub fn draw_global_search_result(
+        &mut self,
+        height: usize,
+        width: usize,
+        fromy: usize,
         options: &Vec<(String, SearchResult)>,
-        selected: usize, offset: usize, elapsed: u128
+        selected: usize,
+        offset: usize,
+        elapsed: u128,
     ) {
         let limit = self.width - self.lp_width - 1;
 
-        let options: Vec<String> = options.iter().enumerate().map(|(i, (path, sr))| {
-            let prefix = format!("{}/{} {}:{} ", i+1, options.len(), sr.line,  sr.column);
-            let path = path.chars().take(limit-prefix.len()).collect::<String>();
-            format!("{} {}", prefix, path)
-        }).collect();
+        let options: Vec<String> = options
+            .iter()
+            .enumerate()
+            .map(|(i, (path, sr))| {
+                let prefix = format!("{}/{} {}:{} ", i + 1, options.len(), sr.line, sr.column);
+                let path = path.chars().take(limit - prefix.len()).collect::<String>();
+                format!("{} {}", prefix, path)
+            })
+            .collect();
 
         let width = options.iter().map(|o| o.len()).max().unwrap_or(width);
 
         for row in 0..options.len() {
-            if row >= options.len() || row >= height { break; }
+            if row >= options.len() || row >= height {
+                break;
+            }
             let option = &options[row + offset];
 
             let is_selected = selected == row + offset;
-            let bgcolor = if is_selected { Color::Grey } else { Color::Reset };
+            let bgcolor = if is_selected {
+                Color::Grey
+            } else {
+                Color::Reset
+            };
 
             let label = format!("{:width$} ", option, width = width);
 
-            let _ = queue!(stdout(),
+            let _ = queue!(
+                stdout(),
                 cursor::MoveTo((self.lp_width) as u16, (row + fromy) as u16),
-                BColor(bgcolor), FColor(self.lncolor), Print(label),
-                terminal::Clear(ClearType::UntilNewLine), BColor(Color::Reset), FColor(Color::Reset),
+                BColor(bgcolor),
+                FColor(self.lncolor),
+                Print(label),
+                terminal::Clear(ClearType::UntilNewLine),
+                BColor(Color::Reset),
+                FColor(Color::Reset),
             );
         }
 
-        let status = format!("global search on '{}', elapsed {} ms {}",
-            &self.search.pattern, elapsed, " ".repeat(20)
+        let status = format!(
+            "global search on '{}', elapsed {} ms {}",
+            &self.search.pattern,
+            elapsed,
+            " ".repeat(20)
         );
 
-        let _ = queue!(stdout(),
-            cursor::MoveTo((self.lp_width) as u16, (self.height-1) as u16),
-            BColor(Color::Reset), FColor(Color::Reset), Print(status),
+        let _ = queue!(
+            stdout(),
+            cursor::MoveTo((self.lp_width) as u16, (self.height - 1) as u16),
+            BColor(Color::Reset),
+            FColor(Color::Reset),
+            Print(status),
         );
 
         stdout().flush().expect("cant flush");
     }
 
     pub fn save_cursor_to_history(&mut self) {
-        if self.code.abs_path.is_empty() { return }
+        if self.code.abs_path.is_empty() {
+            return;
+        }
 
         let cp = CursorPosition {
             filename: self.code.abs_path.clone(),
@@ -3223,22 +3704,30 @@ impl Editor {
     }
 
     async fn move_line_down(&mut self) {
-        if self.r >= self.code.len_lines()-1 { return }
+        if self.r >= self.code.len_lines() - 1 {
+            return;
+        }
 
         let line1len = self.code.line_len(self.r);
-        let line2len = self.code.line_len(self.r+1);
-        let line1 = self.code.get_text(self.r,0, self.r, line1len);
-        let line2 = self.code.get_text(self.r+1,0, self.r+1, line2len);
+        let line2len = self.code.line_len(self.r + 1);
+        let line1 = self.code.get_text(self.r, 0, self.r, line1len);
+        let line2 = self.code.get_text(self.r + 1, 0, self.r + 1, line2len);
 
         let success = self.code.move_line_down(self.r);
-        if !success { return }
+        if !success {
+            return;
+        }
 
         if let Some(lsp) = self.lang2lsp.get(&self.code.lang) {
             let mut lsp = lsp.lock().await;
-            lsp.did_change(self.r, 0, self.r, line1len, &self.code.abs_path, "").await;
-            lsp.did_change(self.r, 0, self.r, 0, &self.code.abs_path, &line2).await;
-            lsp.did_change(self.r+1, 0, self.r+1, line2len, &self.code.abs_path, "").await;
-            lsp.did_change(self.r+1, 0, self.r+1, 0, &self.code.abs_path, &line1).await;
+            lsp.did_change(self.r, 0, self.r, line1len, &self.code.abs_path, "")
+                .await;
+            lsp.did_change(self.r, 0, self.r, 0, &self.code.abs_path, &line2)
+                .await;
+            lsp.did_change(self.r + 1, 0, self.r + 1, line2len, &self.code.abs_path, "")
+                .await;
+            lsp.did_change(self.r + 1, 0, self.r + 1, 0, &self.code.abs_path, &line1)
+                .await;
         }
 
         self.r += 1;
@@ -3250,9 +3739,13 @@ impl Editor {
         self.reset_highlight_cache();
     }
 
-    async fn move_line_up(&mut self)  {
-        if self.r == 0 { return }
-        if self.r >= self.code.len_lines() { return }
+    async fn move_line_up(&mut self) {
+        if self.r == 0 {
+            return;
+        }
+        if self.r >= self.code.len_lines() {
+            return;
+        }
 
         self.r -= 1;
         self.move_line_down().await;
@@ -3268,13 +3761,12 @@ impl Editor {
                     self.node_path = self.code.get_node_path(self.r, self.c);
                     false
                 }
-            },
+            }
             None => {
                 self.node_path = self.code.get_node_path(self.r, self.c);
                 false
-            },
+            }
         };
-
 
         let node = if next && self.node_path.is_some() {
             self.node_path.as_mut().unwrap().next_node()
@@ -3283,7 +3775,8 @@ impl Editor {
         };
 
         if let Some(next_node) = node {
-            self.selection.set_start(next_node.0.row, next_node.0.column);
+            self.selection
+                .set_start(next_node.0.row, next_node.0.column);
             self.selection.set_end(next_node.1.row, next_node.1.column);
             self.selection.active = true;
             self.upd = true;
@@ -3299,13 +3792,12 @@ impl Editor {
                     self.node_path = self.code.get_node_path(self.r, self.c);
                     false
                 }
-            },
+            }
             None => {
                 self.node_path = self.code.get_node_path(self.r, self.c);
                 false
-            },
+            }
         };
-
 
         let node = if prev && self.node_path.is_some() {
             self.node_path.as_mut().unwrap().prev_node()
@@ -3313,9 +3805,9 @@ impl Editor {
             self.node_path.as_mut().unwrap().current_node()
         };
 
-
         if let Some(next_node) = node {
-            self.selection.set_start(next_node.0.row, next_node.0.column);
+            self.selection
+                .set_start(next_node.0.row, next_node.0.column);
             self.selection.set_end(next_node.1.row, next_node.1.column);
             self.selection.active = true;
             self.upd = true;
@@ -3324,7 +3816,6 @@ impl Editor {
             self.upd = true;
         }
     }
-
 }
 
 impl Drop for Editor {
